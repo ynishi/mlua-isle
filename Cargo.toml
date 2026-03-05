@@ -1,0 +1,18 @@
+[package]
+name = "mlua-isle"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Thread-isolated Lua VM with cancellation and async bridge for mlua"
+license = "MIT OR Apache-2.0"
+authors = ["Yutaka Nishimura"]
+repository = "https://github.com/ynishi/mlua-isle"
+homepage = "https://github.com/ynishi/mlua-isle"
+keywords = ["lua", "mlua", "thread", "cancellation", "async"]
+categories = ["concurrency", "api-bindings"]
+
+[dependencies]
+mlua = { version = "0.11", features = ["lua54", "vendored"] }
+thiserror = "2"
+
+[dev-dependencies]
