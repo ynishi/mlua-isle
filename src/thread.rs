@@ -31,9 +31,14 @@ pub(crate) fn run_loop(lua: mlua::Lua, rx: mpsc::Receiver<Request>) {
                 let _ = tx.send(result);
             }
             Request::Exec { f, cancel, tx } => {
-                hook::install_cancel_hook(&lua, cancel, HOOK_INTERVAL);
-                let result = f(&lua);
-                hook::remove_hook(&lua);
+                let result = match hook::install_cancel_hook(&lua, cancel, HOOK_INTERVAL) {
+                    Ok(()) => {
+                        let r = f(&lua);
+                        hook::remove_hook(&lua);
+                        r
+                    }
+                    Err(e) => Err(e),
+                };
                 let _ = tx.send(result);
             }
             Request::Shutdown => break,
@@ -46,7 +51,7 @@ fn execute_eval(
     code: &str,
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
-    hook::install_cancel_hook(lua, cancel.clone(), HOOK_INTERVAL);
+    hook::install_cancel_hook(lua, cancel.clone(), HOOK_INTERVAL)?;
     let result: mlua::Result<mlua::Value> = lua.load(code).eval();
     hook::remove_hook(lua);
 
@@ -62,7 +67,7 @@ fn execute_call(
     args: &[String],
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
-    hook::install_cancel_hook(lua, cancel.clone(), HOOK_INTERVAL);
+    hook::install_cancel_hook(lua, cancel.clone(), HOOK_INTERVAL)?;
 
     let func: mlua::Function = lua
         .globals()
@@ -71,8 +76,9 @@ fn execute_call(
 
     let lua_args: Vec<mlua::Value> = args
         .iter()
-        .map(|s| mlua::Value::String(lua.create_string(s).unwrap()))
-        .collect();
+        .map(|s| lua.create_string(s).map(mlua::Value::String))
+        .collect::<mlua::Result<Vec<_>>>()
+        .map_err(IsleError::from)?;
 
     let multi = mlua::MultiValue::from_vec(lua_args);
     let result: mlua::Result<mlua::Value> = func.call(multi);

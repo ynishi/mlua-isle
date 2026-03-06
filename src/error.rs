@@ -1,7 +1,7 @@
 //! Error types for mlua-isle.
 
 /// Errors returned by Isle operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum IsleError {
     /// The Lua VM thread has already shut down.
     #[error("isle shut down")]

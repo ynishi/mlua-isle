@@ -23,13 +23,19 @@ use std::thread::JoinHandle;
 ///
 /// If the `Isle` is dropped without calling `shutdown`, the channel
 /// disconnects and the Lua thread exits on its next receive attempt.
+#[must_use = "use .shutdown() for clean thread join; dropping without shutdown leaks the thread"]
 pub struct Isle {
     tx: mpsc::Sender<Request>,
     join: Option<JoinHandle<()>>,
 }
 
-// SAFETY: mpsc::Sender is Send. JoinHandle is Send.
-// The Lua VM itself never leaves its thread.
+// SAFETY: `Isle` contains `mpsc::Sender<Request>` and `Option<JoinHandle<()>>`.
+// - `mpsc::Sender::send(&self)` uses internal synchronization (Mutex) and is
+//   safe to call concurrently from multiple threads.
+// - `JoinHandle` is only accessed mutably in `shutdown(mut self)` which takes
+//   ownership, preventing concurrent access.
+// - The `Lua` VM itself never leaves its dedicated thread; `Isle` only holds
+//   the channel endpoint, not the VM.
 unsafe impl Sync for Isle {}
 
 impl Isle {
@@ -136,6 +142,11 @@ impl Isle {
     /// The closure receives `&Lua` and can perform any operation.
     /// This is the escape hatch for complex interactions that don't
     /// fit into `eval` or `call`.
+    ///
+    /// **Note:** The cancel hook only fires during Lua instruction
+    /// execution.  If the closure blocks in Rust code (e.g. HTTP
+    /// calls, file I/O), cancellation will not take effect until
+    /// control returns to the Lua VM.
     pub fn exec<F>(&self, f: F) -> Result<String, IsleError>
     where
         F: FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send + 'static,

@@ -52,8 +52,12 @@ impl Default for CancelToken {
 /// The `interval` controls how often the check runs.  Lower values
 /// give faster cancellation response at the cost of overhead.
 /// A value of 1000 is a reasonable default.
-pub(crate) fn install_cancel_hook(lua: &mlua::Lua, token: CancelToken, interval: u32) {
-    let _ = lua.set_hook(
+pub(crate) fn install_cancel_hook(
+    lua: &mlua::Lua,
+    token: CancelToken,
+    interval: u32,
+) -> Result<(), crate::IsleError> {
+    lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(interval),
         move |_lua, _debug| {
             if token.is_cancelled() {
@@ -62,7 +66,8 @@ pub(crate) fn install_cancel_hook(lua: &mlua::Lua, token: CancelToken, interval:
                 Ok(mlua::VmState::Continue)
             }
         },
-    );
+    )
+    .map_err(crate::IsleError::from)
 }
 
 /// Remove the debug hook (restores normal execution speed).
@@ -92,7 +97,7 @@ mod tests {
     fn hook_interrupts_lua_loop() {
         let lua = mlua::Lua::new();
         let token = CancelToken::new();
-        install_cancel_hook(&lua, token.clone(), 100);
+        install_cancel_hook(&lua, token.clone(), 100).unwrap();
 
         // Schedule cancel after a short spin
         let t = token.clone();

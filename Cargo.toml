@@ -10,9 +10,11 @@ repository = "https://github.com/ynishi/mlua-isle"
 homepage = "https://github.com/ynishi/mlua-isle"
 keywords = ["lua", "mlua", "thread", "cancellation", "async"]
 categories = ["concurrency", "api-bindings"]
+readme = "README.md"
 
 [dependencies]
 mlua = { version = "0.11", features = ["lua54", "vendored"] }
 thiserror = "2"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
