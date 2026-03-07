@@ -42,12 +42,16 @@
 mod error;
 mod handle;
 mod hook;
+#[cfg(feature = "pool")]
+mod pool;
 mod task;
 mod thread;
 
 pub use error::IsleError;
 pub use handle::Isle;
 pub use hook::CancelToken;
+#[cfg(feature = "pool")]
+pub use pool::{IslePool, PoolConfig, PoolStrategy, PooledIsle};
 pub use task::Task;
 
 /// Type alias for exec closures to keep the `Request` enum readable.
