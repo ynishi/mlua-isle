@@ -12,9 +12,14 @@ keywords = ["lua", "mlua", "thread", "cancellation", "async"]
 categories = ["concurrency", "api-bindings"]
 readme = "README.md"
 
+[features]
+default = []
+tokio = ["dep:tokio"]
+
 [dependencies]
 mlua = { version = "0.11", features = ["lua54", "vendored"] }
 thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

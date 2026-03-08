@@ -45,10 +45,20 @@ mod hook;
 mod task;
 mod thread;
 
+#[cfg(feature = "tokio")]
+mod async_isle;
+#[cfg(feature = "tokio")]
+mod async_task;
+
 pub use error::IsleError;
 pub use handle::Isle;
 pub use hook::CancelToken;
 pub use task::Task;
+
+#[cfg(feature = "tokio")]
+pub use async_isle::{AsyncIsle, AsyncIsleBuilder, AsyncIsleDriver};
+#[cfg(feature = "tokio")]
+pub use async_task::AsyncTask;
 
 /// Type alias for exec closures to keep the `Request` enum readable.
 pub(crate) type ExecFn = Box<dyn FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send>;

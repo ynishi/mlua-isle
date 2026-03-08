@@ -1,6 +1,7 @@
 //! Task handle — a cancellable future for a single Lua operation.
 //!
-//! A [`Task`] is returned by [`Isle::spawn_eval`] and [`Isle::spawn_call`].
+//! A [`Task`] is returned by [`Isle::spawn_eval`], [`Isle::spawn_call`],
+//! and [`Isle::spawn_exec`].
 //! It provides a [`CancelToken`] for interruption and a blocking
 //! [`wait`](Task::wait) method to collect the result.
 

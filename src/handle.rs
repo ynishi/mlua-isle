@@ -6,6 +6,7 @@ use crate::task::Task;
 use crate::thread;
 use crate::Request;
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 /// Handle to a thread-isolated Lua VM.
@@ -26,17 +27,8 @@ use std::thread::JoinHandle;
 #[must_use = "use .shutdown() for clean thread join; dropping without shutdown leaks the thread"]
 pub struct Isle {
     tx: mpsc::Sender<Request>,
-    join: Option<JoinHandle<()>>,
+    join: Mutex<Option<JoinHandle<()>>>,
 }
-
-// SAFETY: `Isle` contains `mpsc::Sender<Request>` and `Option<JoinHandle<()>>`.
-// - `mpsc::Sender::send(&self)` uses internal synchronization (Mutex) and is
-//   safe to call concurrently from multiple threads.
-// - `JoinHandle` is only accessed mutably in `shutdown(mut self)` which takes
-//   ownership, preventing concurrent access.
-// - The `Lua` VM itself never leaves its dedicated thread; `Isle` only holds
-//   the channel endpoint, not the VM.
-unsafe impl Sync for Isle {}
 
 impl Isle {
     /// Spawn a new Lua VM on a dedicated thread.
@@ -78,7 +70,7 @@ impl Isle {
 
         Ok(Self {
             tx,
-            join: Some(join),
+            join: Mutex::new(Some(join)),
         })
     }
 
@@ -181,9 +173,10 @@ impl Isle {
     ///
     /// After shutdown, all subsequent requests will return
     /// [`IsleError::Shutdown`].
-    pub fn shutdown(mut self) -> Result<(), IsleError> {
+    pub fn shutdown(self) -> Result<(), IsleError> {
         let _ = self.tx.send(Request::Shutdown);
-        if let Some(join) = self.join.take() {
+        let handle = self.join.lock().map_err(|_| IsleError::ThreadPanic)?.take();
+        if let Some(join) = handle {
             join.join().map_err(|_| IsleError::ThreadPanic)?;
         }
         Ok(())
@@ -191,7 +184,11 @@ impl Isle {
 
     /// Check if the Lua thread is still alive.
     pub fn is_alive(&self) -> bool {
-        self.join.as_ref().is_some_and(|j| !j.is_finished())
+        self.join
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|j| !j.is_finished()))
+            .unwrap_or(false)
     }
 }
 

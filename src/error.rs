@@ -2,6 +2,7 @@
 
 /// Errors returned by Isle operations.
 #[derive(Debug, PartialEq, thiserror::Error)]
+#[non_exhaustive]
 pub enum IsleError {
     /// The Lua VM thread has already shut down.
     #[error("isle shut down")]
@@ -19,11 +20,21 @@ pub enum IsleError {
     #[error("lua thread panicked")]
     ThreadPanic,
 
-    /// Failed to send request to the Lua thread.
-    #[error("send failed (isle shut down)")]
-    SendFailed,
+    /// The request channel is full (backpressure).
+    ///
+    /// Only returned by [`AsyncIsle`](crate::AsyncIsle) `spawn_*` methods
+    /// when the bounded channel has no capacity.  Unlike [`Shutdown`](Self::Shutdown),
+    /// this is a transient condition — the Lua thread is still alive and
+    /// retrying may succeed.
+    #[cfg(feature = "tokio")]
+    #[error("channel full (backpressure)")]
+    ChannelFull,
 
     /// Failed to receive response from the Lua thread.
+    ///
+    /// The oneshot / mpsc response channel was dropped before a result
+    /// was sent.  This typically means the Lua thread panicked or was
+    /// shut down while a request was in flight.
     #[error("recv failed: {0}")]
     RecvFailed(String),
 

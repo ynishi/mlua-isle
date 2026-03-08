@@ -8,7 +8,29 @@ use crate::Request;
 use std::sync::mpsc;
 
 /// Instruction check interval for the cancel hook.
-const HOOK_INTERVAL: u32 = 1000;
+pub(crate) const HOOK_INTERVAL: u32 = 1000;
+
+/// RAII guard that removes the Lua debug hook on drop.
+///
+/// Ensures `remove_hook` is called even if a panic occurs during
+/// Lua execution, preventing a stale hook from affecting subsequent
+/// requests on the same Lua VM.
+struct HookGuard<'a> {
+    lua: &'a mlua::Lua,
+}
+
+impl<'a> HookGuard<'a> {
+    fn new(lua: &'a mlua::Lua, cancel: &hook::CancelToken) -> Result<Self, IsleError> {
+        hook::install_cancel_hook(lua, cancel.clone(), HOOK_INTERVAL)?;
+        Ok(Self { lua })
+    }
+}
+
+impl Drop for HookGuard<'_> {
+    fn drop(&mut self) {
+        hook::remove_hook(self.lua);
+    }
+}
 
 /// Run the Lua event loop on the current thread.
 ///
@@ -31,14 +53,7 @@ pub(crate) fn run_loop(lua: mlua::Lua, rx: mpsc::Receiver<Request>) {
                 let _ = tx.send(result);
             }
             Request::Exec { f, cancel, tx } => {
-                let result = match hook::install_cancel_hook(&lua, cancel, HOOK_INTERVAL) {
-                    Ok(()) => {
-                        let r = f(&lua);
-                        hook::remove_hook(&lua);
-                        r
-                    }
-                    Err(e) => Err(e),
-                };
+                let result = execute_exec(&lua, f, &cancel);
                 let _ = tx.send(result);
             }
             Request::Shutdown => break,
@@ -46,14 +61,13 @@ pub(crate) fn run_loop(lua: mlua::Lua, rx: mpsc::Receiver<Request>) {
     }
 }
 
-fn execute_eval(
+pub(crate) fn execute_eval(
     lua: &mlua::Lua,
     code: &str,
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
-    hook::install_cancel_hook(lua, cancel.clone(), HOOK_INTERVAL)?;
+    let _guard = HookGuard::new(lua, cancel)?;
     let result: mlua::Result<mlua::Value> = lua.load(code).eval();
-    hook::remove_hook(lua);
 
     match result {
         Ok(val) => lua_value_to_string(lua, val),
@@ -61,13 +75,22 @@ fn execute_eval(
     }
 }
 
-fn execute_call(
+pub(crate) fn execute_exec(
+    lua: &mlua::Lua,
+    f: impl FnOnce(&mlua::Lua) -> Result<String, IsleError>,
+    cancel: &hook::CancelToken,
+) -> Result<String, IsleError> {
+    let _guard = HookGuard::new(lua, cancel)?;
+    f(lua)
+}
+
+pub(crate) fn execute_call(
     lua: &mlua::Lua,
     func_name: &str,
     args: &[String],
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
-    hook::install_cancel_hook(lua, cancel.clone(), HOOK_INTERVAL)?;
+    let _guard = HookGuard::new(lua, cancel)?;
 
     let func: mlua::Function = lua
         .globals()
@@ -81,13 +104,8 @@ fn execute_call(
         .map_err(IsleError::from)?;
 
     let multi = mlua::MultiValue::from_vec(lua_args);
-    let result: mlua::Result<mlua::Value> = func.call(multi);
-    hook::remove_hook(lua);
-
-    match result {
-        Ok(val) => lua_value_to_string(lua, val),
-        Err(e) => Err(IsleError::from(e)),
-    }
+    let val: mlua::Value = func.call(multi).map_err(IsleError::from)?;
+    lua_value_to_string(lua, val)
 }
 
 /// Convert a Lua value to a String representation.

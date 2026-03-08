@@ -16,20 +16,47 @@ communicating via channels.
   via a `Send + Sync` handle
 - **Cancellation** — long-running Lua code can be interrupted via `CancelToken`
   using a Lua debug hook
-- **Blocking & async-friendly** — blocking API with `Task` handles for
-  non-blocking usage
-- **Zero unsafe in user code** — the `Isle` handle is safe to share across threads
+- **Sync API** — blocking `Isle` handle with `Task` for non-blocking usage
+- **Async API** (optional, `tokio` feature) — `AsyncIsle` handle with
+  Handle/Driver separation, bounded channel backpressure, and `AsyncTask<T>`
+  which implements `Future`
+- **Zero unsafe in user code** — both `Isle` and `AsyncIsle` are safe to
+  share across threads
 
 ## Architecture
 
+### Sync (`Isle`)
+
 ```text
-┌─────────────────┐   mpsc    ┌──────────────────┐
-│  caller thread   │─────────►│  Lua thread       │
-│  (UI / async)    │          │  (mlua confined)   │
-│                  │◄─────────│                    │
-│  Isle handle     │  oneshot  │  Lua VM + hook    │
-└─────────────────┘           └──────────────────┘
+┌─────────────────┐  std mpsc  ┌──────────────────┐
+│  caller thread   │──────────►│  Lua thread       │
+│                  │           │  (mlua confined)   │
+│  Isle handle     │◄──────────│                    │
+│                  │  oneshot   │  Lua VM + hook    │
+└─────────────────┘            └──────────────────┘
 ```
+
+### Async (`AsyncIsle`, requires `tokio` feature)
+
+```text
+┌──────────────────┐                ┌──────────────────┐
+│  tokio tasks      │  tokio mpsc   │  Lua thread       │
+│                   │──────────────►│  (mlua confined)   │
+│  AsyncIsle handle │  (bounded,    │                    │
+│  (Clone, no Arc)  │  backpressure)│  Lua VM + hook    │
+│                   │◄──────────────│                    │
+│                   │   oneshot     │                    │
+├──────────────────┤                │                    │
+│  AsyncIsleDriver  │───done_tx────►│                    │
+│  (lifecycle owner)│               └──────────────────┘
+└──────────────────┘
+```
+
+- **Handle** (`AsyncIsle`) — lightweight, cloneable. Share across tasks
+  without `Arc`.
+- **Driver** (`AsyncIsleDriver`) — sole lifecycle owner. Call
+  `shutdown().await` for clean thread join, or drop to let the channel-close
+  mechanism terminate the thread naturally.
 
 ## Usage
 
@@ -37,10 +64,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mlua-isle = "0.1"
+mlua-isle = "0.3"
+
+# For async support:
+# mlua-isle = { version = "0.3", features = ["tokio"] }
 ```
 
-### Basic example
+### Sync API
 
 ```rust
 use mlua_isle::Isle;
@@ -56,7 +86,30 @@ assert_eq!(result, "hello");
 isle.shutdown().unwrap();
 ```
 
-### Cancellation
+### Async API
+
+```rust
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use mlua_isle::AsyncIsle;
+
+let (isle, driver) = AsyncIsle::spawn(|lua| {
+    lua.globals().set("greeting", "hello")?;
+    Ok(())
+}).await?;
+
+// Clone freely — no Arc needed.
+let isle2 = isle.clone();
+
+let result: String = isle.eval("return greeting").await?;
+assert_eq!(result, "hello");
+
+driver.shutdown().await?;
+# Ok(())
+# }
+```
+
+### Cancellation (sync)
 
 ```rust
 use mlua_isle::Isle;
@@ -74,7 +127,33 @@ let result = task.wait();
 assert!(result.is_err()); // IsleError::Cancelled
 ```
 
+### Cancellation (async)
+
+```rust
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use mlua_isle::AsyncIsle;
+use std::time::Duration;
+
+let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await?;
+let task = isle.spawn_eval("while true do end");
+
+let token = task.cancel_token().clone();
+tokio::spawn(async move {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    token.cancel();
+});
+
+let result = task.await; // Err(Cancelled)
+assert!(result.is_err());
+driver.shutdown().await?;
+# Ok(())
+# }
+```
+
 ## API
+
+### Sync (`Isle`)
 
 | Method | Description |
 |--------|-------------|
@@ -88,6 +167,22 @@ assert!(result.is_err()); // IsleError::Cancelled
 | `isle.shutdown()` | Graceful shutdown and thread join |
 | `task.wait()` | Block until the task completes |
 | `task.cancel()` | Cancel the running task |
+
+### Async (`AsyncIsle`, `tokio` feature)
+
+| Method | Description |
+|--------|-------------|
+| `AsyncIsle::spawn(init)` | Create a Lua VM, returns `(AsyncIsle, AsyncIsleDriver)` |
+| `AsyncIsle::builder()` | Configure channel capacity / thread name |
+| `isle.eval(code)` | Evaluate a Lua chunk (async) |
+| `isle.call(func, args)` | Call a global Lua function (async) |
+| `isle.exec(closure)` | Run a closure on the Lua thread (async) |
+| `isle.spawn_eval(code)` | Returns a cancellable `AsyncTask` |
+| `isle.spawn_call(func, args)` | Returns a cancellable `AsyncTask` |
+| `isle.spawn_exec(closure)` | Returns a cancellable `AsyncTask` |
+| `driver.shutdown().await` | Graceful shutdown and thread join |
+| `task.cancel()` | Cancel the running task |
+| `task.cancel_token()` | Access the `CancelToken` for sharing |
 
 ## Minimum Supported Rust Version
 
