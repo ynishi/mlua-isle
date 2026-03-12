@@ -29,7 +29,7 @@
 //!    exactly one owner calls `shutdown`.
 //! 4. **Natural channel-close** — When all Handle clones *and* the
 //!    Driver are dropped, every `Sender` clone is dropped, the channel
-//!    disconnects, `blocking_recv` returns `None`, and the Lua thread
+//!    disconnects, `rx.recv()` returns `None`, and the Lua thread
 //!    exits.  The Driver does **not** send a `Shutdown` message on
 //!    drop ([matklad: "in Rust, cancellation is drop"][matklad-stop]).
 //!    This prevents premature thread termination while active Handle
@@ -56,6 +56,61 @@
 //!
 //! [spawn-blocking-doc]: https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html
 //! [bridging]: https://tokio.rs/tokio/topics/bridging
+//!
+//! # Execution models
+//!
+//! `AsyncIsle` provides two execution models.  Both are non-blocking
+//! on the **caller side** — every `spawn_*` / `.await` goes through a
+//! `tokio::sync::oneshot` channel, so the calling tokio tasks are
+//! never blocked regardless of how long the Lua VM takes.
+//!
+//! ## Sync requests (`eval` / `call` / `exec`)
+//!
+//! Processed **inline** on the Lua thread.  While one sync request
+//! runs, the Lua VM is exclusively occupied — other queued requests
+//! (sync or coroutine) wait in the mpsc channel.  This is normal
+//! [actor][actor] behaviour and does **not** affect the caller's
+//! tokio runtime.
+//!
+//! ## Coroutine requests (`coroutine_eval` / `coroutine_call`)
+//!
+//! Executed via [`spawn_local`] + [`Thread::into_async`].  Multiple
+//! coroutines share the Lua VM cooperatively: when one coroutine
+//! calls an async Rust function (registered via
+//! [`Lua::create_async_function`](mlua::Lua::create_async_function)),
+//! it **yields** and other coroutines make progress.
+//!
+//! [`spawn_local`]: tokio::task::spawn_local
+//! [`Thread::into_async`]: mlua::Thread::into_async
+//!
+//! ## Choosing between them
+//!
+//! | Scenario | Recommended API |
+//! |----------|-----------------|
+//! | Simple one-shot evaluation | `eval` / `call` |
+//! | Multiple concurrent Lua tasks with async I/O | `coroutine_eval` / `coroutine_call` |
+//! | Closure with direct `&Lua` access | `exec` |
+//!
+//! ## Mixing sync and coroutine requests
+//!
+//! Sync and coroutine requests can be freely mixed.  While a sync
+//! request is executing, any `spawn_local`'d coroutines are paused
+//! (the Lua VM is single-threaded — `Lua` is [`!Send`]).  Once the
+//! sync request completes, coroutines resume automatically.  This
+//! only affects concurrency **within** the Lua Actor; the caller's
+//! tokio tasks remain unblocked throughout.
+//!
+//! ## Yield points and pure-Lua computation
+//!
+//! Lua coroutines use **cooperative** multitasking — a coroutine only
+//! yields when it hits an async Rust function call.  Pure Lua code
+//! (loops, arithmetic, string ops) runs to completion without
+//! yielding, which is standard Lua [`coroutine`][lua-coro] semantics.
+//! If you need interleaving within CPU-bound Lua code, insert
+//! explicit `coroutine.yield()` calls on the Lua side, or route
+//! the work through an async Rust function that yields.
+//!
+//! [lua-coro]: https://www.lua.org/pil/9.html
 //!
 //! # Example
 //!
@@ -175,7 +230,7 @@ pub struct AsyncIsle {
 /// - **Implicit (drop)**: The Driver's `Sender` clone is dropped.
 ///   The Lua thread continues serving remaining [`AsyncIsle`] handles.
 ///   When **all** handles *and* the Driver have been dropped, the
-///   channel disconnects, `blocking_recv` returns `None`, and the
+///   channel disconnects, `rx.recv()` returns `None`, and the
 ///   thread exits naturally.  See ["in Rust, cancellation is
 ///   drop"][matklad-stop].
 ///
@@ -330,11 +385,29 @@ impl AsyncIsle {
         let join = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
+                // Build the tokio runtime BEFORE signalling init success.
+                // This ensures that a build failure (e.g. fd exhaustion
+                // from epoll_create/kqueue) is reported as IsleError::Init
+                // rather than causing an unrecoverable panic.
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(IsleError::Init(format!(
+                            "tokio runtime build failed: {e}"
+                        ))));
+                        let _ = done_tx.send(());
+                        return;
+                    }
+                };
+
                 let lua = mlua::Lua::new();
                 match init(&lua) {
                     Ok(()) => {
                         let _ = init_tx.send(Ok(()));
-                        run_async_loop(lua, rx);
+                        run_async_loop(lua, rx, rt);
                     }
                     Err(e) => {
                         let _ = init_tx.send(Err(IsleError::Init(e.to_string())));
@@ -361,7 +434,15 @@ impl AsyncIsle {
         Ok((handle, driver))
     }
 
-    /// Evaluate a Lua chunk (async).
+    /// Evaluate a Lua chunk (sync execution on the Lua thread).
+    ///
+    /// The Lua VM is exclusively occupied during execution.  The
+    /// **caller's** tokio task is not blocked (it awaits a oneshot
+    /// channel).  Any active coroutines are paused until this
+    /// request completes.
+    ///
+    /// For cooperative execution that interleaves with other
+    /// coroutines, use [`coroutine_eval`](Self::coroutine_eval).
     ///
     /// Equivalent to `spawn_eval(code).await`.
     pub async fn eval(&self, code: &str) -> Result<String, IsleError> {
@@ -388,7 +469,13 @@ impl AsyncIsle {
         }
     }
 
-    /// Call a named global Lua function with string arguments (async).
+    /// Call a named global Lua function with string arguments
+    /// (sync execution on the Lua thread).
+    ///
+    /// Same threading behaviour as [`eval`](Self::eval) — the Lua VM
+    /// is exclusively occupied; the caller is not blocked.  For
+    /// cooperative execution, use
+    /// [`coroutine_call`](Self::coroutine_call).
     ///
     /// Equivalent to `spawn_call(func, args).await`.
     pub async fn call(&self, func: &str, args: &[&str]) -> Result<String, IsleError> {
@@ -413,7 +500,11 @@ impl AsyncIsle {
         }
     }
 
-    /// Execute an arbitrary closure on the Lua thread (async).
+    /// Execute an arbitrary closure on the Lua thread
+    /// (sync execution).
+    ///
+    /// Same threading behaviour as [`eval`](Self::eval) — the Lua VM
+    /// is exclusively occupied; the caller is not blocked.
     ///
     /// Equivalent to `spawn_exec(f).await`.
     pub async fn exec<F>(&self, f: F) -> Result<String, IsleError>
@@ -443,13 +534,26 @@ impl AsyncIsle {
         }
     }
 
-    /// Evaluate Lua code as a cooperative coroutine (async).
+    /// Evaluate Lua code as a cooperative coroutine.
     ///
     /// Unlike [`eval`](Self::eval), this runs the code inside a Lua
     /// coroutine via [`Thread::into_async`](mlua::Thread::into_async).
     /// When the code calls an async Rust function (registered via
-    /// [`mlua::Lua::create_async_function`]), the coroutine yields and
-    /// other coroutines can make progress on the same VM.
+    /// [`mlua::Lua::create_async_function`]), the coroutine **yields**
+    /// and other coroutines can make progress on the same VM.
+    ///
+    /// The caller's tokio task is not blocked (same as `eval`).
+    ///
+    /// # Yield points
+    ///
+    /// Cooperative scheduling requires yield points.  Pure Lua code
+    /// (no async Rust function calls) runs to completion without
+    /// yielding — this is standard [Lua coroutine semantics][lua-coro].
+    /// To interleave CPU-bound Lua work, either call an async Rust
+    /// function or insert explicit `coroutine.yield()` on the Lua
+    /// side.
+    ///
+    /// [lua-coro]: https://www.lua.org/pil/9.html
     ///
     /// Equivalent to `spawn_coroutine_eval(code).await`.
     pub async fn coroutine_eval(&self, code: &str) -> Result<String, IsleError> {
@@ -473,10 +577,11 @@ impl AsyncIsle {
         }
     }
 
-    /// Call a named function as a cooperative coroutine (async).
+    /// Call a named function as a cooperative coroutine.
     ///
     /// Like [`coroutine_eval`](Self::coroutine_eval) but for calling
-    /// a named global function.
+    /// a named global function.  Same yield-point requirements apply
+    /// — see [`coroutine_eval`](Self::coroutine_eval) for details.
     pub async fn coroutine_call(&self, func: &str, args: &[&str]) -> Result<String, IsleError> {
         self.spawn_coroutine_call(func, args).await
     }
@@ -567,7 +672,7 @@ impl AsyncIsleDriver {
 //   AsyncIsle Handle clones may still be sending requests.
 //   Instead, the Driver's tx is simply dropped, reducing the
 //   sender reference count.  When ALL senders (Handles + Driver)
-//   are dropped, the channel disconnects and blocking_recv()
+//   are dropped, the channel disconnects and rx.recv().await
 //   returns None, exiting the Lua thread naturally.
 
 // ── helpers ──────────────────────────────────────────────────────────
@@ -599,15 +704,33 @@ fn try_send_to_isle_error<T>(err: tokio::sync::mpsc::error::TrySendError<T>) -> 
 /// (`CoroutineEval`/`CoroutineCall`) are `spawn_local`'d and can
 /// interleave — when one yields (e.g. awaiting an async Rust function),
 /// others make progress.
-fn run_async_loop(lua: mlua::Lua, mut rx: tokio::sync::mpsc::Receiver<AsyncRequest>) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to create tokio runtime for Lua thread");
-
+///
+/// # Shutdown and pending coroutines
+///
+/// The request-receive loop is itself `spawn_local`'d, and
+/// `rt.block_on(local)` awaits the [`LocalSet`] as a [`Future`] —
+/// which completes only when **all** `spawn_local`'d tasks have
+/// finished ([tokio `LocalSet` docs][ls-future]).  This means
+/// pending coroutines are drained after `Shutdown` rather than
+/// being abruptly cancelled.  Coroutines stuck in infinite loops
+/// can still be cancelled via their [`CancelToken`].
+///
+/// This follows the [tokio `LocalSet` recommended pattern][ls-pattern].
+///
+/// [ls-future]: https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html
+/// [ls-pattern]: https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html#use-inside-a-thread
+/// [`Future`]: std::future::Future
+fn run_async_loop(
+    lua: mlua::Lua,
+    mut rx: tokio::sync::mpsc::Receiver<AsyncRequest>,
+    rt: tokio::runtime::Runtime,
+) {
     let local = tokio::task::LocalSet::new();
 
-    local.block_on(&rt, async move {
+    // Spawn the request-receive loop as a local task.
+    // When this task breaks (Shutdown or channel close), it
+    // completes — but other spawn_local'd coroutines continue.
+    local.spawn_local(async move {
         while let Some(req) = rx.recv().await {
             match req {
                 // ── Sync requests (backward-compatible, blocks event loop) ──
@@ -658,6 +781,11 @@ fn run_async_loop(lua: mlua::Lua, mut rx: tokio::sync::mpsc::Receiver<AsyncReque
             tokio::task::yield_now().await;
         }
     });
+
+    // Drive the LocalSet until ALL spawn_local'd tasks complete.
+    // After the receive loop breaks (Shutdown), this continues
+    // running pending coroutines to completion — graceful drain.
+    rt.block_on(local);
 }
 
 /// Execute Lua code as a coroutine via [`Thread::into_async`](mlua::Thread::into_async).

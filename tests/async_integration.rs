@@ -601,3 +601,29 @@ async fn coroutine_mixed_with_sync() {
 
     driver.shutdown().await.unwrap();
 }
+
+/// Pending coroutines are drained (not aborted) on shutdown.
+#[tokio::test]
+async fn coroutine_pending_drained_on_shutdown() {
+    let (isle, driver) = AsyncIsle::spawn(|lua| {
+        let sleep_fn = lua.create_async_function(|_, ms: u64| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok(ms)
+        })?;
+        lua.globals().set("async_sleep", sleep_fn)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // Spawn a coroutine that takes 80ms.
+    let task = isle.spawn_coroutine_eval("return async_sleep(80)");
+
+    // Immediately request shutdown — the coroutine is still running.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    driver.shutdown().await.unwrap();
+
+    // The coroutine should have been drained (completed), not aborted.
+    let result = task.await;
+    assert_eq!(result.unwrap(), "80");
+}
