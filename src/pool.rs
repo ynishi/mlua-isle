@@ -36,8 +36,8 @@
 
 use crate::error::IsleError;
 use crate::handle::Isle;
+use std::cell::Cell;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -126,6 +126,7 @@ impl IslePool {
     ///
     /// - [`IsleError::Shutdown`] if the pool has been shut down.
     /// - [`IsleError::Init`] if spawning a new Isle fails.
+    /// - [`IsleError::PoolPoisoned`] if the internal lock is poisoned.
     pub fn checkout(&self) -> Result<PooledIsle<'_>, IsleError> {
         let mut inner = self.lock_inner()?;
 
@@ -134,60 +135,39 @@ impl IslePool {
                 return Err(IsleError::Shutdown);
             }
 
-            if let Some(isle) = self.take_alive_isle(&mut inner) {
-                inner.active += 1;
-                return Ok(PooledIsle::new(self, isle));
-            }
-
-            if self.can_grow(&inner) {
-                inner.active += 1;
-                drop(inner); // release lock before blocking spawn
-                match self.spawn_isle() {
-                    Ok(isle) => return Ok(PooledIsle::new(self, isle)),
-                    Err(e) => {
-                        self.dec_active();
-                        return Err(e);
-                    }
+            match self.try_acquire(inner)? {
+                Acquired::Isle(pooled) => return Ok(pooled),
+                Acquired::NeedWait(guard) => {
+                    inner = self
+                        .condvar
+                        .wait(guard)
+                        .map_err(|e| IsleError::PoolPoisoned(e.to_string()))?;
                 }
             }
-
-            // All slots occupied — wait for a return
-            inner = self
-                .condvar
-                .wait(inner)
-                .map_err(|e| IsleError::Init(format!("pool condvar poisoned: {e}")))?;
         }
     }
 
     /// Try to checkout an Isle without blocking.
     ///
-    /// Returns `None` if no Isle is immediately available and the pool
-    /// is at capacity.
-    pub fn try_checkout(&self) -> Option<PooledIsle<'_>> {
-        let mut inner = self.inner.lock().ok()?;
+    /// Returns `Ok(None)` if no Isle is immediately available and the
+    /// pool is at capacity.
+    ///
+    /// # Errors
+    ///
+    /// - [`IsleError::Shutdown`] if the pool has been shut down.
+    /// - [`IsleError::Init`] if spawning a new Isle fails.
+    /// - [`IsleError::PoolPoisoned`] if the internal lock is poisoned.
+    pub fn try_checkout(&self) -> Result<Option<PooledIsle<'_>>, IsleError> {
+        let inner = self.lock_inner()?;
 
         if inner.closed {
-            return None;
+            return Err(IsleError::Shutdown);
         }
 
-        if let Some(isle) = self.take_alive_isle(&mut inner) {
-            inner.active += 1;
-            return Some(PooledIsle::new(self, isle));
+        match self.try_acquire(inner)? {
+            Acquired::Isle(pooled) => Ok(Some(pooled)),
+            Acquired::NeedWait(_) => Ok(None),
         }
-
-        if self.can_grow(&inner) {
-            inner.active += 1;
-            drop(inner);
-            match self.spawn_isle() {
-                Ok(isle) => return Some(PooledIsle::new(self, isle)),
-                Err(_) => {
-                    self.dec_active();
-                    return None;
-                }
-            }
-        }
-
-        None
     }
 
     /// Checkout with a timeout.
@@ -203,52 +183,20 @@ impl IslePool {
                 return Err(IsleError::Shutdown);
             }
 
-            if let Some(isle) = self.take_alive_isle(&mut inner) {
-                inner.active += 1;
-                return Ok(PooledIsle::new(self, isle));
-            }
-
-            if self.can_grow(&inner) {
-                inner.active += 1;
-                drop(inner);
-                match self.spawn_isle() {
-                    Ok(isle) => return Ok(PooledIsle::new(self, isle)),
-                    Err(e) => {
-                        self.dec_active();
-                        return Err(e);
+            match self.try_acquire(inner)? {
+                Acquired::Isle(pooled) => return Ok(pooled),
+                Acquired::NeedWait(guard) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(IsleError::PoolExhausted(self.config.max_size));
                     }
-                }
-            }
 
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(IsleError::PoolExhausted(self.config.max_size));
-            }
-
-            let (guard, wait_result) = self
-                .condvar
-                .wait_timeout(inner, remaining)
-                .map_err(|e| IsleError::Init(format!("pool condvar poisoned: {e}")))?;
-            inner = guard;
-
-            if wait_result.timed_out() {
-                // Final attempt before giving up
-                if let Some(isle) = self.take_alive_isle(&mut inner) {
-                    inner.active += 1;
-                    return Ok(PooledIsle::new(self, isle));
+                    let (guard, _) = self
+                        .condvar
+                        .wait_timeout(guard, remaining)
+                        .map_err(|e| IsleError::PoolPoisoned(e.to_string()))?;
+                    inner = guard;
                 }
-                if self.can_grow(&inner) {
-                    inner.active += 1;
-                    drop(inner);
-                    match self.spawn_isle() {
-                        Ok(isle) => return Ok(PooledIsle::new(self, isle)),
-                        Err(e) => {
-                            self.dec_active();
-                            return Err(e);
-                        }
-                    }
-                }
-                return Err(IsleError::PoolExhausted(self.config.max_size));
             }
         }
     }
@@ -280,6 +228,35 @@ impl IslePool {
     }
 
     // ── internal ────────────────────────────────────────────────────
+
+    /// Attempt to acquire an Isle from idle list or by growing the pool.
+    ///
+    /// On success, returns `Acquired::Isle`.  If no Isle is available
+    /// and the pool is at capacity, returns `Acquired::NeedWait` with
+    /// the lock guard so the caller can decide how to wait.
+    fn try_acquire<'a>(
+        &'a self,
+        mut inner: std::sync::MutexGuard<'a, PoolInner>,
+    ) -> Result<Acquired<'a>, IsleError> {
+        if let Some(isle) = self.take_alive_isle(&mut inner) {
+            inner.active += 1;
+            return Ok(Acquired::Isle(PooledIsle::new(self, isle)));
+        }
+
+        if self.can_grow(&inner) {
+            inner.active += 1;
+            drop(inner);
+            match self.spawn_isle() {
+                Ok(isle) => Ok(Acquired::Isle(PooledIsle::new(self, isle))),
+                Err(e) => {
+                    self.dec_active();
+                    Err(e)
+                }
+            }
+        } else {
+            Ok(Acquired::NeedWait(inner))
+        }
+    }
 
     /// Return an Isle to the pool (called by `PooledIsle::drop`).
     fn return_isle(&self, isle: Isle) {
@@ -327,7 +304,6 @@ impl IslePool {
             if isle.is_alive() {
                 return Some(isle);
             }
-            // Dead isle — drop silently
         }
         None
     }
@@ -347,7 +323,7 @@ impl IslePool {
     fn lock_inner(&self) -> Result<std::sync::MutexGuard<'_, PoolInner>, IsleError> {
         self.inner
             .lock()
-            .map_err(|e| IsleError::Init(format!("pool mutex poisoned: {e}")))
+            .map_err(|e| IsleError::PoolPoisoned(e.to_string()))
     }
 
     /// Decrement active count after a failed spawn.
@@ -361,6 +337,14 @@ impl IslePool {
     }
 }
 
+/// Result of [`IslePool::try_acquire`].
+enum Acquired<'pool> {
+    /// Successfully acquired an Isle.
+    Isle(PooledIsle<'pool>),
+    /// No Isle available; caller should wait or return.
+    NeedWait(std::sync::MutexGuard<'pool, PoolInner>),
+}
+
 /// RAII guard for a checked-out [`Isle`].
 ///
 /// Dereferences to `Isle` for direct use of `eval`, `call`, `exec`,
@@ -370,14 +354,14 @@ impl IslePool {
 pub struct PooledIsle<'pool> {
     pool: &'pool IslePool,
     isle: Option<Isle>,
-    killed: AtomicBool,
+    killed: Cell<bool>,
 }
 
 impl std::fmt::Debug for PooledIsle<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PooledIsle")
             .field("alive", &self.isle.as_ref().map(|i| i.is_alive()))
-            .field("killed", &self.killed.load(Ordering::Relaxed))
+            .field("killed", &self.killed.get())
             .finish()
     }
 }
@@ -387,7 +371,7 @@ impl<'pool> PooledIsle<'pool> {
         Self {
             pool,
             isle: Some(isle),
-            killed: AtomicBool::new(false),
+            killed: Cell::new(false),
         }
     }
 
@@ -398,7 +382,7 @@ impl<'pool> PooledIsle<'pool> {
     /// next checkout.  Use this when the VM is in a bad state
     /// (e.g. corrupted globals, resource leak).
     pub fn kill(&self) {
-        self.killed.store(true, Ordering::Release);
+        self.killed.set(true);
     }
 }
 
@@ -413,7 +397,7 @@ impl Deref for PooledIsle<'_> {
 impl Drop for PooledIsle<'_> {
     fn drop(&mut self) {
         if let Some(isle) = self.isle.take() {
-            if self.killed.load(Ordering::Acquire) {
+            if self.killed.get() {
                 self.pool.discard_isle(isle);
             } else {
                 self.pool.return_isle(isle);

@@ -160,7 +160,7 @@ fn try_checkout_returns_none_when_exhausted() {
 
     let _isle = pool.checkout().unwrap();
     assert!(
-        pool.try_checkout().is_none(),
+        pool.try_checkout().unwrap().is_none(),
         "should return None when pool exhausted"
     );
 
@@ -178,8 +178,8 @@ fn try_checkout_succeeds_when_available() {
     )
     .unwrap();
 
-    let isle = pool.try_checkout();
-    assert!(isle.is_some());
+    let isle = pool.try_checkout().unwrap();
+    assert!(isle.is_some(), "should return Some when available");
     let isle = isle.unwrap();
     assert_eq!(isle.eval("return 1").unwrap(), "1");
 

@@ -46,6 +46,11 @@ pub enum IsleError {
     #[cfg(feature = "pool")]
     #[error("pool exhausted (max_size={0})")]
     PoolExhausted(usize),
+
+    /// Pool internal lock poisoned (another thread panicked while holding the lock).
+    #[cfg(feature = "pool")]
+    #[error("pool lock poisoned: {0}")]
+    PoolPoisoned(String),
 }
 
 impl From<mlua::Error> for IsleError {
