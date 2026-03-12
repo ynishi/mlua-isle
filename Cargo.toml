@@ -3,12 +3,12 @@ name = "mlua-isle"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.77"
-description = "Thread-isolated Lua VM with cancellation and async bridge for mlua"
+description = "Thread-isolated Lua VM with cancellation, async coroutines, and connection pool for mlua"
 license = "MIT OR Apache-2.0"
 authors = ["Yutaka Nishimura"]
 repository = "https://github.com/ynishi/mlua-isle"
 homepage = "https://github.com/ynishi/mlua-isle"
-keywords = ["lua", "mlua", "thread", "cancellation", "async"]
+keywords = ["lua", "mlua", "thread", "async", "pool"]
 categories = ["concurrency", "api-bindings"]
 readme = "README.md"
 
