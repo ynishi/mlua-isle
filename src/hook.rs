@@ -75,6 +75,31 @@ pub(crate) fn remove_hook(lua: &mlua::Lua) {
     lua.remove_hook();
 }
 
+/// Install a cancel hook on a Lua coroutine thread.
+///
+/// Same as [`install_cancel_hook`] but targets a specific [`Thread`](mlua::Thread)
+/// instead of the main Lua state.  Used for cooperative coroutine execution
+/// where each coroutine needs its own cancel check.
+#[cfg(feature = "tokio")]
+pub(crate) fn install_cancel_hook_on_thread(
+    thread: &mlua::Thread,
+    token: CancelToken,
+    interval: u32,
+) -> Result<(), crate::IsleError> {
+    thread
+        .set_hook(
+            mlua::HookTriggers::new().every_nth_instruction(interval),
+            move |_lua, _debug| {
+                if token.is_cancelled() {
+                    Err(mlua::Error::runtime("__isle_cancelled__"))
+                } else {
+                    Ok(mlua::VmState::Continue)
+                }
+            },
+        )
+        .map_err(crate::IsleError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

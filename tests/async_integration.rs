@@ -423,3 +423,181 @@ async fn builder_all_options() {
     assert_eq!(result, "99");
     driver.shutdown().await.unwrap();
 }
+
+// ── Coroutine tests ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn coroutine_eval_simple() {
+    let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await.unwrap();
+    let result = isle.coroutine_eval("return 1 + 2").await.unwrap();
+    assert_eq!(result, "3");
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_eval_string() {
+    let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await.unwrap();
+    let result = isle.coroutine_eval("return 'hello'").await.unwrap();
+    assert_eq!(result, "hello");
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_eval_nil() {
+    let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await.unwrap();
+    let result = isle.coroutine_eval("return nil").await.unwrap();
+    assert_eq!(result, "");
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_eval_error() {
+    let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await.unwrap();
+    let result = isle.coroutine_eval("error('boom')").await;
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("boom"));
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_eval_accesses_globals() {
+    let (isle, driver) = AsyncIsle::spawn(|lua| {
+        lua.globals().set("val", 42)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let result = isle.coroutine_eval("return val * 2").await.unwrap();
+    assert_eq!(result, "84");
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_call_simple() {
+    let (isle, driver) = AsyncIsle::spawn(|lua| {
+        lua.load("function add(a, b) return a .. b end").exec()?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let result = isle
+        .coroutine_call("add", &["hello", " world"])
+        .await
+        .unwrap();
+    assert_eq!(result, "hello world");
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_eval_cancel() {
+    let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await.unwrap();
+    let task = isle.spawn_coroutine_eval("while true do end");
+
+    let token = task.cancel_token().clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+    });
+
+    let start = Instant::now();
+    let result = task.await;
+
+    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cancel took too long"
+    );
+
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_still_works_after_cancel() {
+    let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await.unwrap();
+
+    // Cancel a coroutine
+    let task = isle.spawn_coroutine_eval("while true do end");
+    let token = task.cancel_token().clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        token.cancel();
+    });
+    let _ = task.await;
+
+    // Isle should still work
+    let result = isle.coroutine_eval("return 'ok'").await.unwrap();
+    assert_eq!(result, "ok");
+
+    driver.shutdown().await.unwrap();
+}
+
+/// Multiple coroutines can interleave on the same VM when one yields.
+#[tokio::test]
+async fn coroutine_concurrent_with_async_function() {
+    let (isle, driver) = AsyncIsle::spawn(|lua| {
+        // Register an async Rust function that sleeps briefly.
+        let sleep_fn = lua.create_async_function(|_, ms: u64| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok(ms)
+        })?;
+        lua.globals().set("async_sleep", sleep_fn)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let start = Instant::now();
+
+    // Launch two coroutines that each sleep 50ms.
+    // If they run sequentially: ~100ms.  If cooperative: ~50ms.
+    let t1 = isle.spawn_coroutine_eval("return async_sleep(50)");
+    let t2 = isle.spawn_coroutine_eval("return async_sleep(50)");
+
+    let (r1, r2) = tokio::join!(t1, t2);
+    let elapsed = start.elapsed();
+
+    assert_eq!(r1.unwrap(), "50");
+    assert_eq!(r2.unwrap(), "50");
+
+    // With cooperative scheduling, both should complete in ~50-80ms,
+    // not ~100ms.  Use a generous threshold to avoid flaky CI.
+    assert!(
+        elapsed < Duration::from_millis(90),
+        "coroutines ran sequentially ({elapsed:?}), expected cooperative interleaving"
+    );
+
+    driver.shutdown().await.unwrap();
+}
+
+/// Mixing sync eval and coroutine eval works correctly.
+#[tokio::test]
+async fn coroutine_mixed_with_sync() {
+    let (isle, driver) = AsyncIsle::spawn(|lua| {
+        lua.globals().set("counter", 0)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // Sync eval
+    let r1 = isle
+        .eval("counter = counter + 1; return counter")
+        .await
+        .unwrap();
+    assert_eq!(r1, "1");
+
+    // Coroutine eval
+    let r2 = isle
+        .coroutine_eval("counter = counter + 10; return counter")
+        .await
+        .unwrap();
+    assert_eq!(r2, "11");
+
+    // Sync eval again — state should persist
+    let r3 = isle.eval("return counter").await.unwrap();
+    assert_eq!(r3, "11");
+
+    driver.shutdown().await.unwrap();
+}

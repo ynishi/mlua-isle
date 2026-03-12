@@ -14,7 +14,7 @@ readme = "README.md"
 
 [features]
 default = []
-tokio = ["dep:tokio"]
+tokio = ["dep:tokio", "mlua/async"]
 
 [dependencies]
 mlua = { version = "0.11", features = ["lua54", "vendored"] }

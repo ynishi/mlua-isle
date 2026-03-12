@@ -114,7 +114,7 @@ pub(crate) fn execute_call(
 /// - `String` → the string
 /// - `Integer/Number/Boolean` → tostring
 /// - `Table` → serialized via tostring (or a simple repr)
-fn lua_value_to_string(lua: &mlua::Lua, val: mlua::Value) -> Result<String, IsleError> {
+pub(crate) fn lua_value_to_string(lua: &mlua::Lua, val: mlua::Value) -> Result<String, IsleError> {
     match val {
         mlua::Value::Nil => Ok(String::new()),
         mlua::Value::String(s) => s
