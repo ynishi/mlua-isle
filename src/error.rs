@@ -41,6 +41,11 @@ pub enum IsleError {
     /// Error during Isle initialization.
     #[error("init error: {0}")]
     Init(String),
+
+    /// All pool slots are in use and no Isle is available.
+    #[cfg(feature = "pool")]
+    #[error("pool exhausted (max_size={0})")]
+    PoolExhausted(usize),
 }
 
 impl From<mlua::Error> for IsleError {

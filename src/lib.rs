@@ -42,6 +42,8 @@
 mod error;
 mod handle;
 mod hook;
+#[cfg(feature = "pool")]
+mod pool;
 mod task;
 mod thread;
 
@@ -54,6 +56,9 @@ pub use error::IsleError;
 pub use handle::Isle;
 pub use hook::CancelToken;
 pub use task::Task;
+
+#[cfg(feature = "pool")]
+pub use pool::{IslePool, PoolConfig, PoolStrategy, PooledIsle};
 
 #[cfg(feature = "tokio")]
 pub use async_isle::{AsyncIsle, AsyncIsleBuilder, AsyncIsleDriver};
