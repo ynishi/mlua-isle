@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-04-18
+
+### Added
+- `CancelToken::cancelled` — async cancellation signal backed by
+  `tokio::sync::Notify` (tokio feature only).  Registers the
+  `Notified` future via `enable()` before re-checking the flag, so
+  a `cancel()` call racing with `cancelled()` is not lost.
+
+### Fixed
+- Coroutines suspended inside a Rust `.await` (e.g. a
+  `create_async_function` awaiting a tokio child process) can now be
+  cancelled.  `execute_coroutine_eval` / `execute_coroutine_call`
+  race the coroutine future against `CancelToken::cancelled` in a
+  `tokio::select!`; when cancel wins, dropping the `AsyncThread`
+  releases the awaited Rust resources via the standard async
+  cancellation model.  Previously the Lua debug hook was the only
+  cancel path, and it cannot fire while no Lua instructions execute.
+
+## [0.4.0] - 2026-03-12
+
 ### Added
 - `coroutine_eval` / `coroutine_call` on `AsyncIsle` — cooperative coroutine
   execution via `mlua::Thread::into_async` + `tokio::task::spawn_local`.
