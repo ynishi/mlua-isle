@@ -11,9 +11,27 @@ use std::sync::Arc;
 /// Cancellation signal shared between caller and Lua thread.
 ///
 /// Clone is cheap (Arc).
+///
+/// Two cancellation pathways are wired:
+///
+/// 1. A Lua debug hook polls [`is_cancelled`](Self::is_cancelled) every
+///    `N` Lua instructions.  This interrupts pure-Lua CPU-bound loops
+///    (`while true do end` etc).
+///
+/// 2. When the feature `tokio` is enabled, [`cancelled`](Self::cancelled)
+///    provides an async signal that fires as soon as [`cancel`](Self::cancel)
+///    is called.  Coroutine executors (`execute_coroutine_eval`,
+///    `execute_coroutine_call`) use this in a `tokio::select!` to drop
+///    the in-flight Lua coroutine even when the coroutine is suspended
+///    inside a Rust `.await` (e.g. a `create_async_function` awaiting a
+///    tokio child process).  The debug hook alone cannot interrupt such
+///    Rust-suspended coroutines because no Lua instructions execute
+///    during the `.await`, so the hook never fires.
 #[derive(Clone)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
+    #[cfg(feature = "tokio")]
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl CancelToken {
@@ -21,17 +39,58 @@ impl CancelToken {
     pub fn new() -> Self {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "tokio")]
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     /// Signal cancellation.
+    ///
+    /// Sets the atomic flag (observed by the Lua debug hook) and, when
+    /// the `tokio` feature is enabled, notifies all waiters of the
+    /// async [`cancelled`](Self::cancelled) signal.
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Release);
+        #[cfg(feature = "tokio")]
+        self.notify.notify_waiters();
     }
 
     /// Check whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
+    }
+
+    /// Await cancellation (async).
+    ///
+    /// Returns immediately if already cancelled; otherwise resolves
+    /// when [`cancel`](Self::cancel) is called.  Intended for use in
+    /// `tokio::select!` to race a Lua coroutine against its cancel
+    /// signal — when this future wins, dropping the other branch
+    /// releases any Rust async resources (e.g. a spawned child
+    /// process) that the coroutine was awaiting.
+    ///
+    /// Race-free: the returned future is registered with the
+    /// underlying [`tokio::sync::Notify`] via
+    /// [`Notified::enable`](tokio::sync::futures::Notified::enable)
+    /// before the flag is re-checked, so a `cancel()` call that
+    /// happens between `cancelled()` being constructed and awaited
+    /// is not lost.
+    #[cfg(feature = "tokio")]
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Re-check after enabling: a cancel() that happened between
+        // the initial is_cancelled() check and enable() would have
+        // called notify_waiters() without us being registered, so
+        // this second read catches it.
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
     }
 }
 

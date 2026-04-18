@@ -789,6 +789,19 @@ fn run_async_loop(
 }
 
 /// Execute Lua code as a coroutine via [`Thread::into_async`](mlua::Thread::into_async).
+///
+/// Cancellation is wired on two paths (see [`CancelToken`] docs):
+///
+/// - The Lua debug hook interrupts pure-Lua CPU-bound loops at
+///   `HOOK_INTERVAL` instructions.
+/// - `tokio::select!` against [`CancelToken::cancelled`] drops the
+///   coroutine future when it is suspended inside a Rust `.await`
+///   (e.g. a `create_async_function` awaiting a tokio child process),
+///   a state in which the debug hook alone cannot fire because no
+///   Lua instructions execute.  Dropping the `AsyncThread` releases
+///   the awaited Rust future, which in turn drops its resources
+///   (spawned processes, open sockets, etc.) via the standard Rust
+///   async cancellation model.
 async fn execute_coroutine_eval(
     lua: &mlua::Lua,
     code: &str,
@@ -800,16 +813,26 @@ async fn execute_coroutine_eval(
 
     hook::install_cancel_hook_on_thread(&thread, cancel.clone(), thread::HOOK_INTERVAL)?;
 
-    let val: mlua::Value = thread
-        .into_async(())
-        .map_err(IsleError::from)?
-        .await
-        .map_err(IsleError::from)?;
+    let run = async {
+        thread
+            .into_async(())
+            .map_err(IsleError::from)?
+            .await
+            .map_err(IsleError::from)
+    };
+
+    let val: mlua::Value = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(IsleError::Cancelled),
+        res = run => res?,
+    };
 
     thread::lua_value_to_string(lua, val)
 }
 
 /// Call a named function as a coroutine via [`Thread::into_async`](mlua::Thread::into_async).
+///
+/// See [`execute_coroutine_eval`] for cancellation semantics.
 async fn execute_coroutine_call(
     lua: &mlua::Lua,
     func_name: &str,
@@ -832,11 +855,20 @@ async fn execute_coroutine_call(
         .map_err(IsleError::from)?;
 
     let multi = mlua::MultiValue::from_vec(lua_args);
-    let val: mlua::Value = thread
-        .into_async(multi)
-        .map_err(IsleError::from)?
-        .await
-        .map_err(IsleError::from)?;
+
+    let run = async {
+        thread
+            .into_async(multi)
+            .map_err(IsleError::from)?
+            .await
+            .map_err(IsleError::from)
+    };
+
+    let val: mlua::Value = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(IsleError::Cancelled),
+        res = run => res?,
+    };
 
     thread::lua_value_to_string(lua, val)
 }
