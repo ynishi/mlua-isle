@@ -468,3 +468,166 @@ async fn pool_metrics_track_active_and_idle() {
 
     pool.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Scenario: VM isolation — distinct VMs do not share runtime state
+// ---------------------------------------------------------------------------
+
+/// With `max_size > 1` and `Warm`, two simultaneously-checked-out VMs
+/// must have isolated globals.  Writes on one slot's `Isle` must not be
+/// visible from the other slot's `Isle`, even after a warm round-trip.
+#[tokio::test]
+async fn scenario_vm_isolation_across_concurrent_checkouts() {
+    let pool = AsyncIslePool::new(
+        |_lua| Ok(()),
+        PoolConfig {
+            max_size: 2,
+            strategy: PoolStrategy::Warm,
+        },
+    )
+    .unwrap();
+
+    let isle_a = pool.checkout().await.unwrap();
+    let isle_b = pool.checkout().await.unwrap();
+
+    isle_a.eval("tag = 'A'").await.unwrap();
+    isle_b.eval("tag = 'B'").await.unwrap();
+
+    assert_eq!(isle_a.eval("return tag").await.unwrap(), "A");
+    assert_eq!(isle_b.eval("return tag").await.unwrap(), "B");
+
+    drop(isle_a);
+    drop(isle_b);
+
+    // After warm return, each slot still carries its own tag.  The
+    // exact checkout order is not guaranteed, so we collect both
+    // observed tags into a set.
+    let isle1 = pool.checkout().await.unwrap();
+    let isle2 = pool.checkout().await.unwrap();
+    let t1 = isle1.eval("return tag").await.unwrap();
+    let t2 = isle2.eval("return tag").await.unwrap();
+    let mut tags = [t1, t2];
+    tags.sort();
+    assert_eq!(
+        tags,
+        ["A".to_string(), "B".to_string()],
+        "distinct warm slots must carry their own state"
+    );
+
+    drop(isle1);
+    drop(isle2);
+    pool.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: mixed sync + coroutine workload across the pool
+// ---------------------------------------------------------------------------
+
+/// Many tokio tasks checkout from a small pool and exercise both
+/// `eval` (sync) and `coroutine_eval` (cooperative) paths.  All tasks
+/// must complete and the pool must end with all slots idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_mixed_workload_eval_and_coroutine() {
+    let pool = Arc::new(
+        AsyncIslePool::new(
+            |lua| {
+                lua.load(
+                    r#"
+                    function double(x)
+                        return tonumber(x) * 2
+                    end
+                    "#,
+                )
+                .exec()?;
+                Ok(())
+            },
+            PoolConfig {
+                max_size: 3,
+                strategy: PoolStrategy::Warm,
+            },
+        )
+        .unwrap(),
+    );
+
+    let mut handles = Vec::new();
+    for i in 0..12 {
+        let pool = Arc::clone(&pool);
+        handles.push(tokio::spawn(async move {
+            let isle = pool.checkout().await.unwrap();
+            // Alternate: even → coroutine path, odd → sync path.
+            if i % 2 == 0 {
+                let code = format!("return {} + 100", i);
+                let r = isle.coroutine_eval(&code).await.unwrap();
+                assert_eq!(r, (i + 100).to_string());
+            } else {
+                let r = isle.call("double", &[&i.to_string()]).await.unwrap();
+                assert_eq!(r, (i * 2).to_string());
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // All 12 tasks completed; pool must converge to active=0 with idle
+    // bounded by max_size.
+    assert_eq!(pool.active(), 0);
+    assert!(pool.idle() <= 3);
+
+    pool.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: lifecycle — kill mid-run, pool respawns, warm reuse resumes
+// ---------------------------------------------------------------------------
+
+/// A pool of size 1 with `Warm`: poison the VM, `kill()` it, observe the
+/// next checkout get a fresh VM, then verify subsequent warm round-trips
+/// preserve state on the new VM.
+#[tokio::test]
+async fn scenario_lifecycle_kill_then_warm_reuse() {
+    let pool = AsyncIslePool::new(
+        |lua| {
+            lua.globals().set("base", 7)?;
+            Ok(())
+        },
+        PoolConfig {
+            max_size: 1,
+            strategy: PoolStrategy::Warm,
+        },
+    )
+    .unwrap();
+
+    // Step 1: poison and kill.
+    {
+        let mut isle = pool.checkout().await.unwrap();
+        isle.eval("scratch = 'dirty'").await.unwrap();
+        isle.kill();
+    }
+
+    // Wait for the background driver shutdown to release the slot.
+    for _ in 0..50 {
+        if pool.active() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Step 2: fresh VM — factory ran again (base=7), scratch is gone.
+    {
+        let isle = pool.checkout().await.unwrap();
+        assert_eq!(isle.eval("return base").await.unwrap(), "7");
+        assert_eq!(isle.eval("return type(scratch)").await.unwrap(), "nil");
+        isle.eval("scratch = 'clean'").await.unwrap();
+    }
+
+    // Step 3: warm round-trip on the new VM preserves state.
+    {
+        let isle = pool.checkout().await.unwrap();
+        assert_eq!(isle.eval("return scratch").await.unwrap(), "clean");
+    }
+
+    pool.shutdown().await;
+}
+
