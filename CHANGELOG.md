@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-14
+
 ### Added
 - `AsyncIslePool` / `AsyncPooledIsle` — async counterpart of `IslePool`,
   gated behind `pool` + `tokio` features.  Holds `(AsyncIsle, AsyncIsleDriver)`
