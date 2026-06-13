@@ -20,7 +20,7 @@ tokio = ["dep:tokio", "mlua/async"]
 [dependencies]
 mlua = { version = "0.11", features = ["lua54", "vendored"] }
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "rt"], optional = true }
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

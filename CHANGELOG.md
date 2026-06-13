@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+- `AsyncIslePool` / `AsyncPooledIsle` — async counterpart of `IslePool`,
+  gated behind `pool` + `tokio` features.  Holds `(AsyncIsle, AsyncIsleDriver)`
+  slots, supports `Cold` / `Warm` strategies, and exposes
+  `checkout` / `try_checkout` / `checkout_timeout` / `active` / `idle` /
+  `shutdown` mirrored on the sync `IslePool` API.  Idle wait uses
+  `tokio::sync::Notify`; `Drop` is synchronous and dispatches the inner
+  driver shutdown to a background `tokio::spawn` when a runtime handle
+  is available (otherwise the Lua thread exits via channel-close).
+
+### Fixed
+- `tokio` feature now enables the `tokio/macros` and `tokio/time` cargo
+  features needed by `tokio::select!` (in `async_isle`) and `tokio::time::*`
+  (in `async_pool::checkout_timeout`).  Previously the crate built only
+  via dev-dependency feature unification with `--all-features`; building
+  with just `--features tokio` failed.
+
 ## [0.4.1] - 2026-04-18
 
 ### Added

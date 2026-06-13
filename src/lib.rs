@@ -49,6 +49,8 @@ mod thread;
 
 #[cfg(feature = "tokio")]
 mod async_isle;
+#[cfg(all(feature = "pool", feature = "tokio"))]
+mod async_pool;
 #[cfg(feature = "tokio")]
 mod async_task;
 
@@ -62,6 +64,8 @@ pub use pool::{IslePool, PoolConfig, PoolStrategy, PooledIsle};
 
 #[cfg(feature = "tokio")]
 pub use async_isle::{AsyncIsle, AsyncIsleBuilder, AsyncIsleDriver};
+#[cfg(all(feature = "pool", feature = "tokio"))]
+pub use async_pool::{AsyncIslePool, AsyncPooledIsle};
 #[cfg(feature = "tokio")]
 pub use async_task::AsyncTask;
 

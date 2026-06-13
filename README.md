@@ -26,6 +26,11 @@ communicating via channels.
 - **Connection pool** (optional, `pool` feature) — `IslePool` manages
   multiple `Isle` instances with checkout/return semantics.  Supports
   `Cold` (fresh VM) and `Warm` (reuse) strategies
+- **Async connection pool** (optional, `pool` + `tokio` features) —
+  `AsyncIslePool` is the async counterpart of `IslePool`: `checkout` /
+  `try_checkout` / `checkout_timeout` are async, idle wait uses
+  `tokio::sync::Notify`, and each slot owns both an `AsyncIsle` handle
+  and its `AsyncIsleDriver` so VMs can be joined on shutdown
 - **Zero unsafe in user code** — both `Isle` and `AsyncIsle` are safe to
   share across threads
 
