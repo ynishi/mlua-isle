@@ -274,7 +274,7 @@ driver.shutdown().await?;
 
 ## Minimum Supported Rust Version
 
-Rust 1.77 or later.
+Rust 1.88 or later.
 
 ## License
 

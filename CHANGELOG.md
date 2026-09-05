@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-05
+
+### Changed
+- **Breaking**: `mlua` dependency bumped from `0.11` to `0.12`.  `mlua`
+  types appear in the public API (`&mlua::Lua` / `mlua::Error` in exec
+  closures), so downstream crates must use `mlua 0.12` as well.
+- MSRV raised from 1.77 to 1.88 (required by `mlua 0.12`).
+- No source changes were needed: every `mlua` API used by this crate
+  (`set_hook` / `remove_hook` / `HookTriggers` / `VmState` /
+  `Thread::into_async` / `MultiValue::from_vec` / `Error::runtime`) kept
+  its signature and crate-root re-export in `mlua 0.12`.
+- Picks up the `mlua 0.12.1` fix for coroutine stack handling after
+  yielding from hooks, which affects the `AsyncIsle` cancel-hook path.
+
 ## [0.5.0] - 2026-06-14
 
 ### Added
