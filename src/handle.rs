@@ -51,13 +51,16 @@ impl Isle {
             .name("mlua-isle".into())
             .spawn(move || {
                 let lua = mlua::Lua::new();
-                match init(&lua) {
+                match init(&lua)
+                    .map_err(|e| IsleError::Init(e.to_string()))
+                    .and_then(|()| crate::hook::install_cancel_hook(&lua, thread::HOOK_INTERVAL))
+                {
                     Ok(()) => {
                         let _ = init_tx.send(Ok(()));
                         thread::run_loop(lua, rx);
                     }
                     Err(e) => {
-                        let _ = init_tx.send(Err(IsleError::Init(e.to_string())));
+                        let _ = init_tx.send(Err(e));
                     }
                 }
             })

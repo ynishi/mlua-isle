@@ -400,3 +400,30 @@ async fn shutdown_from_tokio() {
 
     assert!(result.is_ok());
 }
+
+/// The cancel hook reaches coroutines created by the Lua code itself.
+#[test]
+fn spawn_eval_cancel_loop_in_lua_created_coroutine() {
+    let isle = Isle::spawn(|_lua| Ok(())).unwrap();
+    let task = isle.spawn_eval("coroutine.wrap(function() while true do end end)()");
+
+    std::thread::sleep(Duration::from_millis(50));
+    task.cancel();
+
+    let start = Instant::now();
+    let result = loop {
+        if let Some(r) = task.try_recv() {
+            break r;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancel did not reach the nested coroutine"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+
+    // The isle is still usable.
+    assert_eq!(isle.eval("return 1").unwrap(), "1");
+    isle.shutdown().unwrap();
+}

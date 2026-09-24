@@ -5,6 +5,7 @@
 //! raises a Lua error containing the sentinel `__isle_cancelled__`,
 //! which is recognized by [`IsleError::from(mlua::Error)`].
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -16,13 +17,16 @@ use std::sync::Arc;
 ///
 /// 1. A Lua debug hook polls [`is_cancelled`](Self::is_cancelled) every
 ///    `N` Lua instructions.  This interrupts pure-Lua CPU-bound loops
-///    (`while true do end` etc).
+///    (`while true do end` etc), including loops inside coroutines
+///    that the Lua code itself creates.
 ///
 /// 2. When the feature `tokio` is enabled, [`cancelled`](Self::cancelled)
 ///    provides an async signal that fires as soon as [`cancel`](Self::cancel)
 ///    is called.  Coroutine executors (`execute_coroutine_eval`,
 ///    `execute_coroutine_call`) use this in a `tokio::select!` to drop
-///    the in-flight Lua coroutine even when the coroutine is suspended
+///    the in-flight Lua coroutine (built with
+///    [`Function::call_async`](mlua::Function::call_async), so the drop
+///    terminates the coroutine at once) even when it is suspended
 ///    inside a Rust `.await` (e.g. a `create_async_function` awaiting a
 ///    tokio child process).  The debug hook alone cannot interrupt such
 ///    Rust-suspended coroutines because no Lua instructions execute
@@ -100,26 +104,65 @@ impl Default for CancelToken {
     }
 }
 
-/// Install a Lua debug hook that checks the cancel token every N instructions.
+thread_local! {
+    /// Token of the request currently executing on this Lua thread.
+    ///
+    /// Each isle owns a dedicated OS thread, so a thread-local is
+    /// equivalent to per-VM state.  The global cancel hook reads it.
+    static CURRENT: RefCell<Option<CancelToken>> = const { RefCell::new(None) };
+}
+
+/// RAII guard that makes `token` the current token of this thread.
 ///
-/// When the token is cancelled, the hook raises a Lua error with a
-/// sentinel message that [`IsleError`](crate::IsleError) recognizes as
-/// a cancellation.
+/// The previous token is restored on drop, so guards nest.
+pub(crate) struct EnterGuard {
+    prev: Option<CancelToken>,
+}
+
+impl EnterGuard {
+    pub(crate) fn new(token: &CancelToken) -> Self {
+        let prev = CURRENT.with(|c| c.replace(Some(token.clone())));
+        Self { prev }
+    }
+}
+
+impl Drop for EnterGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        CURRENT.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Install the cancel hook as a Lua **global** hook.
+///
+/// Called once per VM, after the user's init closure.  The hook
+/// raises a Lua error with a sentinel message that
+/// [`IsleError`](crate::IsleError) recognizes as a cancellation when
+/// the token of the request currently executing on this thread (see
+/// [`EnterGuard`]) is cancelled.
+///
+/// # Why a global hook
+///
+/// A per-thread hook ([`mlua::Lua::set_hook`] /
+/// [`mlua::Thread::set_hook`]) does not reach coroutines created
+/// from Lua (`coroutine.create` / `coroutine.wrap`): Lua copies the C
+/// hook into the new thread, but mlua finds no callback registered
+/// for that thread and removes the hook the first time it fires.  A
+/// CPU loop inside such a coroutine could then never be cancelled.
+/// The global hook's callback is shared by every thread of the VM.
 ///
 /// # Instruction interval
 ///
 /// The `interval` controls how often the check runs.  Lower values
 /// give faster cancellation response at the cost of overhead.
 /// A value of 1000 is a reasonable default.
-pub(crate) fn install_cancel_hook(
-    lua: &mlua::Lua,
-    token: CancelToken,
-    interval: u32,
-) -> Result<(), crate::IsleError> {
-    lua.set_hook(
+pub(crate) fn install_cancel_hook(lua: &mlua::Lua, interval: u32) -> Result<(), crate::IsleError> {
+    lua.set_global_hook(
         mlua::HookTriggers::new().every_nth_instruction(interval),
-        move |_lua, _debug| {
-            if token.is_cancelled() {
+        |_lua, _debug| {
+            let cancelled =
+                CURRENT.with(|c| c.borrow().as_ref().is_some_and(CancelToken::is_cancelled));
+            if cancelled {
                 Err(mlua::Error::runtime("__isle_cancelled__"))
             } else {
                 Ok(mlua::VmState::Continue)
@@ -129,34 +172,38 @@ pub(crate) fn install_cancel_hook(
     .map_err(crate::IsleError::from)
 }
 
-/// Remove the debug hook (restores normal execution speed).
-pub(crate) fn remove_hook(lua: &mlua::Lua) {
-    lua.remove_hook();
+/// Future adapter that makes `token` the current token while the
+/// inner future is polled.
+///
+/// Coroutine requests interleave on one Lua thread, so the current
+/// token must be switched on every poll rather than once per request.
+#[cfg(feature = "tokio")]
+pub(crate) struct Scoped<F> {
+    token: CancelToken,
+    fut: std::pin::Pin<Box<F>>,
 }
 
-/// Install a cancel hook on a Lua coroutine thread.
-///
-/// Same as [`install_cancel_hook`] but targets a specific [`Thread`](mlua::Thread)
-/// instead of the main Lua state.  Used for cooperative coroutine execution
-/// where each coroutine needs its own cancel check.
 #[cfg(feature = "tokio")]
-pub(crate) fn install_cancel_hook_on_thread(
-    thread: &mlua::Thread,
-    token: CancelToken,
-    interval: u32,
-) -> Result<(), crate::IsleError> {
-    thread
-        .set_hook(
-            mlua::HookTriggers::new().every_nth_instruction(interval),
-            move |_lua, _debug| {
-                if token.is_cancelled() {
-                    Err(mlua::Error::runtime("__isle_cancelled__"))
-                } else {
-                    Ok(mlua::VmState::Continue)
-                }
-            },
-        )
-        .map_err(crate::IsleError::from)
+impl<F> Scoped<F> {
+    pub(crate) fn new(token: CancelToken, fut: F) -> Self {
+        Self {
+            token,
+            fut: Box::pin(fut),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<F: std::future::Future> std::future::Future for Scoped<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let _enter = EnterGuard::new(&self.token);
+        self.fut.as_mut().poll(cx)
+    }
 }
 
 #[cfg(test)]
@@ -181,7 +228,8 @@ mod tests {
     fn hook_interrupts_lua_loop() {
         let lua = mlua::Lua::new();
         let token = CancelToken::new();
-        install_cancel_hook(&lua, token.clone(), 100).unwrap();
+        install_cancel_hook(&lua, 100).unwrap();
+        let _enter = EnterGuard::new(&token);
 
         // Schedule cancel after a short spin
         let t = token.clone();
@@ -197,5 +245,46 @@ mod tests {
             err_msg.contains("__isle_cancelled__"),
             "expected cancellation sentinel, got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn hook_interrupts_loop_in_lua_created_coroutine() {
+        let lua = mlua::Lua::new();
+        let token = CancelToken::new();
+        install_cancel_hook(&lua, 100).unwrap();
+        let _enter = EnterGuard::new(&token);
+
+        let t = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            t.cancel();
+        });
+
+        let result: mlua::Result<()> = lua
+            .load("coroutine.wrap(function() while true do end end)()")
+            .exec();
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("__isle_cancelled__"),
+            "expected cancellation sentinel, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn hook_ignores_cancelled_token_that_is_not_current() {
+        let lua = mlua::Lua::new();
+        install_cancel_hook(&lua, 100).unwrap();
+        let other = CancelToken::new();
+        other.cancel();
+        {
+            let _outer = EnterGuard::new(&other);
+            let _inner = EnterGuard::new(&CancelToken::new());
+            let r: i64 = lua
+                .load("local n = 0 for i = 1, 100000 do n = n + 1 end return n")
+                .eval()
+                .unwrap();
+            assert_eq!(r, 100000);
+        }
+        assert!(CURRENT.with(|c| c.borrow().is_none()));
     }
 }

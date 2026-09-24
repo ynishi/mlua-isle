@@ -627,3 +627,130 @@ async fn coroutine_pending_drained_on_shutdown() {
     let result = task.await;
     assert_eq!(result.unwrap(), "80");
 }
+
+/// Cancel a nested-coroutine CPU loop and check the isle still answers.
+async fn assert_nested_loop_cancels(isle: &AsyncIsle, task: mlua_isle::AsyncTask) {
+    let token = task.cancel_token().clone();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    token.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("cancel did not reach the nested coroutine");
+    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+
+    let probe = tokio::time::timeout(Duration::from_secs(2), isle.eval("return 1"))
+        .await
+        .expect("isle thread is stuck");
+    assert_eq!(probe.unwrap(), "1");
+}
+
+const NESTED_LOOP: &str = "coroutine.wrap(function() while true do end end)()";
+
+#[tokio::test]
+async fn spawn_eval_cancel_loop_in_lua_created_coroutine() {
+    let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await.unwrap();
+    let task = isle.spawn_eval(NESTED_LOOP);
+    assert_nested_loop_cancels(&isle, task).await;
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_eval_cancel_loop_in_lua_created_coroutine() {
+    let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await.unwrap();
+    let task = isle.spawn_coroutine_eval(NESTED_LOOP);
+    assert_nested_loop_cancels(&isle, task).await;
+    driver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn coroutine_call_cancel_loop_in_lua_created_coroutine() {
+    let (isle, driver) = AsyncIsle::spawn(|lua| {
+        lua.load(format!("function spin() {NESTED_LOOP} end"))
+            .exec()
+    })
+    .await
+    .unwrap();
+    let task = isle.spawn_coroutine_call("spin", &[]);
+    assert_nested_loop_cancels(&isle, task).await;
+    driver.shutdown().await.unwrap();
+}
+
+/// Records when it is dropped.
+struct DropProbe(std::sync::Arc<std::sync::Mutex<Option<Instant>>>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = Some(Instant::now());
+    }
+}
+
+/// Cancelling a coroutine request releases the Rust future it awaits
+/// right away, not at the next Lua GC cycle or at shutdown.
+#[tokio::test]
+async fn coroutine_cancel_drops_awaited_future_immediately() {
+    let dropped_at = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (d, f) = (dropped_at.clone(), finished.clone());
+    let (isle, driver) = AsyncIsle::spawn(move |lua| {
+        let hold = lua.create_async_function(move |_, ()| {
+            let (d, f) = (d.clone(), f.clone());
+            async move {
+                let _probe = DropProbe(d);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                f.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        })?;
+        lua.globals().set("hold", hold)
+    })
+    .await
+    .unwrap();
+
+    let task = isle.spawn_coroutine_eval("hold() return 'done'");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cancelled_at = Instant::now();
+    task.cancel();
+    assert_eq!(task.await.unwrap_err(), IsleError::Cancelled);
+
+    // No collectgarbage() and no shutdown: the drop must already be done.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let dropped_at = dropped_at
+        .lock()
+        .unwrap()
+        .expect("awaited future was not dropped on cancel");
+    assert!(
+        dropped_at.duration_since(cancelled_at) < Duration::from_millis(50),
+        "drop was delayed: {:?}",
+        dropped_at.duration_since(cancelled_at)
+    );
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+
+    driver.shutdown().await.unwrap();
+}
+
+/// Cancelling a coroutine request closes its pending to-be-closed variables.
+#[tokio::test]
+async fn coroutine_cancel_closes_to_be_closed_variables() {
+    let (isle, driver) = AsyncIsle::spawn(|lua| {
+        let hold = lua.create_async_function(|_, ()| async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        })?;
+        lua.globals().set("hold", hold)?;
+        lua.globals().set("closed", false)
+    })
+    .await
+    .unwrap();
+
+    let task = isle.spawn_coroutine_eval(
+        "local guard <close> = setmetatable({}, { __close = function() closed = true end }) \
+         hold()",
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    task.cancel();
+    assert_eq!(task.await.unwrap_err(), IsleError::Cancelled);
+
+    assert_eq!(isle.eval("return closed").await.unwrap(), "true");
+    driver.shutdown().await.unwrap();
+}
