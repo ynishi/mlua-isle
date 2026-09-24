@@ -15,21 +15,40 @@ use std::sync::mpsc;
 /// - [`wait`](Task::wait) for the result (blocking).
 /// - [`cancel`](Task::cancel) the operation.
 /// - [`try_recv`](Task::try_recv) to poll without blocking.
+///
+/// Dropping a `Task` before its result was received **cancels** the
+/// operation.  Call [`detach`](Task::detach) to let it run to completion
+/// without keeping the handle.
+#[must_use = "dropping a Task cancels the operation; use `.detach()` to let it run"]
 pub struct Task<T = String> {
     rx: mpsc::Receiver<Result<T, IsleError>>,
     cancel: CancelToken,
+    /// Result received or detached: dropping must not cancel.
+    released: std::cell::Cell<bool>,
 }
 
 impl<T> Task<T> {
     pub(crate) fn new(rx: mpsc::Receiver<Result<T, IsleError>>, cancel: CancelToken) -> Self {
-        Self { rx, cancel }
+        Self {
+            rx,
+            cancel,
+            released: std::cell::Cell::new(false),
+        }
     }
 
     /// Block until the result is available.
     pub fn wait(self) -> Result<T, IsleError> {
-        self.rx
-            .recv()
-            .map_err(|e| IsleError::RecvFailed(e.to_string()))?
+        let result = self.rx.recv();
+        self.released.set(true);
+        result.map_err(|e| IsleError::RecvFailed(e.to_string()))?
+    }
+
+    /// Let the operation run to completion without this handle.
+    ///
+    /// The result is discarded.  The operation can still be cancelled
+    /// through a clone of its [`cancel_token`](Self::cancel_token).
+    pub fn detach(self) {
+        self.released.set(true);
     }
 
     /// Cancel the operation.
@@ -42,11 +61,23 @@ impl<T> Task<T> {
 
     /// Non-blocking poll for the result.
     pub fn try_recv(&self) -> Option<Result<T, IsleError>> {
-        self.rx.try_recv().ok()
+        let result = self.rx.try_recv().ok();
+        if result.is_some() {
+            self.released.set(true);
+        }
+        result
     }
 
     /// Access the cancel token (e.g. to share with other code).
     pub fn cancel_token(&self) -> &CancelToken {
         &self.cancel
+    }
+}
+
+impl<T> Drop for Task<T> {
+    fn drop(&mut self) {
+        if !self.released.get() {
+            self.cancel.cancel();
+        }
     }
 }

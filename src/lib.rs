@@ -42,6 +42,7 @@
 mod error;
 mod handle;
 mod hook;
+pub mod hooks;
 #[cfg(feature = "pool")]
 mod pool;
 mod task;
@@ -53,10 +54,16 @@ mod async_isle;
 mod async_pool;
 #[cfg(feature = "tokio")]
 mod async_task;
+#[cfg(feature = "tokio")]
+mod scope;
+#[cfg(feature = "tokio")]
+pub mod tasks;
 
 pub use error::IsleError;
 pub use handle::Isle;
-pub use hook::CancelToken;
+pub use hook::{current_token, CancelToken};
+#[cfg(feature = "tokio")]
+pub use scope::{cancellable, run_root};
 pub use task::Task;
 
 #[cfg(feature = "pool")]

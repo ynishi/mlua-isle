@@ -138,7 +138,7 @@
 
 use crate::async_task::AsyncTask;
 use crate::error::IsleError;
-use crate::hook::{self, CancelToken};
+use crate::hook::CancelToken;
 use crate::thread;
 use std::thread::JoinHandle;
 
@@ -406,7 +406,7 @@ impl AsyncIsle {
                 let lua = mlua::Lua::new();
                 match init(&lua)
                     .map_err(|e| IsleError::Init(e.to_string()))
-                    .and_then(|()| hook::install_cancel_hook(&lua, thread::HOOK_INTERVAL))
+                    .and_then(|()| crate::hooks::install(&lua))
                 {
                     Ok(()) => {
                         let _ = init_tx.send(Ok(()));
@@ -791,42 +791,31 @@ fn run_async_loop(
     rt.block_on(local);
 }
 
-/// Execute Lua code as a coroutine via [`Function::call_async`](mlua::Function::call_async).
+/// Execute Lua code as a coroutine request (see [`crate::run_root`]).
 ///
 /// Cancellation is wired on two paths (see [`CancelToken`] docs):
 ///
-/// - The Lua debug hook interrupts pure-Lua CPU-bound loops at
-///   `HOOK_INTERVAL` instructions.
-/// - `tokio::select!` against [`CancelToken::cancelled`] drops the
-///   coroutine future when it is suspended inside a Rust `.await`
-///   (e.g. a `create_async_function` awaiting a tokio child process),
-///   a state in which the debug hook alone cannot fire because no
-///   Lua instructions execute.  `call_async` marks its coroutine
-///   recyclable, so dropping the future terminates the coroutine at
-///   once: the awaited Rust future is dropped (releasing spawned
-///   processes, open sockets, etc.) and pending to-be-closed
-///   variables are closed.  A coroutine built with
-///   [`Thread::into_async`](mlua::Thread::into_async) would instead
-///   keep the future alive until the next Lua GC cycle.
-///
-/// The future is wrapped in [`hook::Scoped`] so that the global
-/// cancel hook sees this request's token whenever the coroutine runs.
+/// - The isle's global hook interrupts pure-Lua CPU-bound loops,
+///   including loops in coroutines the Lua code creates.
+/// - Once the token is cancelled, the coroutine gets the VM's cancel
+///   grace to finish, then its future is dropped even when it is
+///   suspended inside a Rust `.await` (e.g. a `create_async_function`
+///   awaiting a tokio child process), a state in which the hook cannot
+///   fire because no Lua instructions execute.  The coroutine is built
+///   with [`Function::call_async`](mlua::Function::call_async), which
+///   marks it recyclable, so the drop terminates it at once: the
+///   awaited Rust future is dropped (releasing spawned processes, open
+///   sockets, etc.) and pending to-be-closed variables are closed.  A
+///   coroutine built with [`Thread::into_async`](mlua::Thread::into_async)
+///   would instead keep the future alive until the next Lua GC cycle.
 async fn execute_coroutine_eval(
     lua: &mlua::Lua,
     code: &str,
     cancel: &CancelToken,
 ) -> Result<String, IsleError> {
     let func = lua.load(code).into_function().map_err(IsleError::from)?;
-
-    let run = hook::Scoped::new(cancel.clone(), func.call_async::<mlua::Value>(()));
-
-    let val: mlua::Value = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Err(IsleError::Cancelled),
-        res = run => res.map_err(IsleError::from)?,
-    };
-
-    thread::lua_value_to_string(lua, val)
+    let values = crate::scope::run_root(lua, cancel.clone(), func, mlua::MultiValue::new()).await?;
+    thread::lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
 }
 
 /// Call a named function as a coroutine via [`Function::call_async`](mlua::Function::call_async).
@@ -850,14 +839,6 @@ async fn execute_coroutine_call(
         .map_err(IsleError::from)?;
 
     let multi = mlua::MultiValue::from_vec(lua_args);
-
-    let run = hook::Scoped::new(cancel.clone(), func.call_async::<mlua::Value>(multi));
-
-    let val: mlua::Value = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Err(IsleError::Cancelled),
-        res = run => res.map_err(IsleError::from)?,
-    };
-
-    thread::lua_value_to_string(lua, val)
+    let values = crate::scope::run_root(lua, cancel.clone(), func, multi).await?;
+    thread::lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
 }
