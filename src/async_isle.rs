@@ -74,14 +74,14 @@
 //!
 //! ## Coroutine requests (`coroutine_eval` / `coroutine_call`)
 //!
-//! Executed via [`spawn_local`] + [`Thread::into_async`].  Multiple
+//! Executed via [`spawn_local`] + [`Function::call_async`].  Multiple
 //! coroutines share the Lua VM cooperatively: when one coroutine
 //! calls an async Rust function (registered via
 //! [`Lua::create_async_function`](mlua::Lua::create_async_function)),
 //! it **yields** and other coroutines make progress.
 //!
 //! [`spawn_local`]: tokio::task::spawn_local
-//! [`Thread::into_async`]: mlua::Thread::into_async
+//! [`Function::call_async`]: mlua::Function::call_async
 //!
 //! ## Choosing between them
 //!
@@ -168,8 +168,8 @@ enum AsyncRequest {
     },
     /// Evaluate Lua code as a coroutine (cooperative, non-blocking).
     ///
-    /// Unlike `Eval`, this wraps the code in a Lua `Thread` and runs it
-    /// via `into_async()` + `spawn_local`.  When the coroutine yields
+    /// Unlike `Eval`, this runs the code in a Lua coroutine via
+    /// `call_async()` + `spawn_local`.  When the coroutine yields
     /// (e.g. awaiting an async Rust function registered via
     /// `create_async_function`), other coroutines can make progress.
     CoroutineEval {
@@ -404,13 +404,16 @@ impl AsyncIsle {
                 };
 
                 let lua = mlua::Lua::new();
-                match init(&lua) {
+                match init(&lua)
+                    .map_err(|e| IsleError::Init(e.to_string()))
+                    .and_then(|()| hook::install_cancel_hook(&lua, thread::HOOK_INTERVAL))
+                {
                     Ok(()) => {
                         let _ = init_tx.send(Ok(()));
                         run_async_loop(lua, rx, rt);
                     }
                     Err(e) => {
-                        let _ = init_tx.send(Err(IsleError::Init(e.to_string())));
+                        let _ = init_tx.send(Err(e));
                     }
                 }
                 // Signal completion to the driver.
@@ -537,7 +540,7 @@ impl AsyncIsle {
     /// Evaluate Lua code as a cooperative coroutine.
     ///
     /// Unlike [`eval`](Self::eval), this runs the code inside a Lua
-    /// coroutine via [`Thread::into_async`](mlua::Thread::into_async).
+    /// coroutine via [`Function::call_async`](mlua::Function::call_async).
     /// When the code calls an async Rust function (registered via
     /// [`mlua::Lua::create_async_function`]), the coroutine **yields**
     /// and other coroutines can make progress on the same VM.
@@ -788,7 +791,7 @@ fn run_async_loop(
     rt.block_on(local);
 }
 
-/// Execute Lua code as a coroutine via [`Thread::into_async`](mlua::Thread::into_async).
+/// Execute Lua code as a coroutine via [`Function::call_async`](mlua::Function::call_async).
 ///
 /// Cancellation is wired on two paths (see [`CancelToken`] docs):
 ///
@@ -798,10 +801,16 @@ fn run_async_loop(
 ///   coroutine future when it is suspended inside a Rust `.await`
 ///   (e.g. a `create_async_function` awaiting a tokio child process),
 ///   a state in which the debug hook alone cannot fire because no
-///   Lua instructions execute.  Dropping the `AsyncThread` releases
-///   the awaited Rust future, which in turn drops its resources
-///   (spawned processes, open sockets, etc.) via the standard Rust
-///   async cancellation model.
+///   Lua instructions execute.  `call_async` marks its coroutine
+///   recyclable, so dropping the future terminates the coroutine at
+///   once: the awaited Rust future is dropped (releasing spawned
+///   processes, open sockets, etc.) and pending to-be-closed
+///   variables are closed.  A coroutine built with
+///   [`Thread::into_async`](mlua::Thread::into_async) would instead
+///   keep the future alive until the next Lua GC cycle.
+///
+/// The future is wrapped in [`hook::Scoped`] so that the global
+/// cancel hook sees this request's token whenever the coroutine runs.
 async fn execute_coroutine_eval(
     lua: &mlua::Lua,
     code: &str,
@@ -809,28 +818,18 @@ async fn execute_coroutine_eval(
 ) -> Result<String, IsleError> {
     let func = lua.load(code).into_function().map_err(IsleError::from)?;
 
-    let thread = lua.create_thread(func).map_err(IsleError::from)?;
-
-    hook::install_cancel_hook_on_thread(&thread, cancel.clone(), thread::HOOK_INTERVAL)?;
-
-    let run = async {
-        thread
-            .into_async(())
-            .map_err(IsleError::from)?
-            .await
-            .map_err(IsleError::from)
-    };
+    let run = hook::Scoped::new(cancel.clone(), func.call_async::<mlua::Value>(()));
 
     let val: mlua::Value = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(IsleError::Cancelled),
-        res = run => res?,
+        res = run => res.map_err(IsleError::from)?,
     };
 
     thread::lua_value_to_string(lua, val)
 }
 
-/// Call a named function as a coroutine via [`Thread::into_async`](mlua::Thread::into_async).
+/// Call a named function as a coroutine via [`Function::call_async`](mlua::Function::call_async).
 ///
 /// See [`execute_coroutine_eval`] for cancellation semantics.
 async fn execute_coroutine_call(
@@ -844,10 +843,6 @@ async fn execute_coroutine_call(
         .get(func_name)
         .map_err(|e| IsleError::Lua(format!("function '{func_name}' not found: {e}")))?;
 
-    let thread = lua.create_thread(func).map_err(IsleError::from)?;
-
-    hook::install_cancel_hook_on_thread(&thread, cancel.clone(), thread::HOOK_INTERVAL)?;
-
     let lua_args: Vec<mlua::Value> = args
         .iter()
         .map(|s| lua.create_string(s).map(mlua::Value::String))
@@ -856,18 +851,12 @@ async fn execute_coroutine_call(
 
     let multi = mlua::MultiValue::from_vec(lua_args);
 
-    let run = async {
-        thread
-            .into_async(multi)
-            .map_err(IsleError::from)?
-            .await
-            .map_err(IsleError::from)
-    };
+    let run = hook::Scoped::new(cancel.clone(), func.call_async::<mlua::Value>(multi));
 
     let val: mlua::Value = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(IsleError::Cancelled),
-        res = run => res?,
+        res = run => res.map_err(IsleError::from)?,
     };
 
     thread::lua_value_to_string(lua, val)

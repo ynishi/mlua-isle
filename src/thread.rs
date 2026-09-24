@@ -10,28 +10,6 @@ use std::sync::mpsc;
 /// Instruction check interval for the cancel hook.
 pub(crate) const HOOK_INTERVAL: u32 = 1000;
 
-/// RAII guard that removes the Lua debug hook on drop.
-///
-/// Ensures `remove_hook` is called even if a panic occurs during
-/// Lua execution, preventing a stale hook from affecting subsequent
-/// requests on the same Lua VM.
-struct HookGuard<'a> {
-    lua: &'a mlua::Lua,
-}
-
-impl<'a> HookGuard<'a> {
-    fn new(lua: &'a mlua::Lua, cancel: &hook::CancelToken) -> Result<Self, IsleError> {
-        hook::install_cancel_hook(lua, cancel.clone(), HOOK_INTERVAL)?;
-        Ok(Self { lua })
-    }
-}
-
-impl Drop for HookGuard<'_> {
-    fn drop(&mut self) {
-        hook::remove_hook(self.lua);
-    }
-}
-
 /// Run the Lua event loop on the current thread.
 ///
 /// This function blocks until a `Shutdown` request is received or the
@@ -66,7 +44,7 @@ pub(crate) fn execute_eval(
     code: &str,
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
-    let _guard = HookGuard::new(lua, cancel)?;
+    let _enter = hook::EnterGuard::new(cancel);
     let result: mlua::Result<mlua::Value> = lua.load(code).eval();
 
     match result {
@@ -80,7 +58,7 @@ pub(crate) fn execute_exec(
     f: impl FnOnce(&mlua::Lua) -> Result<String, IsleError>,
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
-    let _guard = HookGuard::new(lua, cancel)?;
+    let _enter = hook::EnterGuard::new(cancel);
     f(lua)
 }
 
@@ -90,7 +68,7 @@ pub(crate) fn execute_call(
     args: &[String],
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
-    let _guard = HookGuard::new(lua, cancel)?;
+    let _enter = hook::EnterGuard::new(cancel);
 
     let func: mlua::Function = lua
         .globals()
