@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-24
+
 ### Added
 - `CancelToken::child_token` — a token cancelled together with its parent.
   Finished children leave the parent without an explicit unregister.
