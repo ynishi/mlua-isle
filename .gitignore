@@ -1,1 +1,7 @@
 /target
+/workspace/
+/.claude/
+/.worktrees/
+workspace
+.claude
+.worktrees

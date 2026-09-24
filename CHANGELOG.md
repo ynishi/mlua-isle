@@ -37,6 +37,16 @@
   `.detach()` for the old behaviour.  Both types are `#[must_use]`.
 - The isle re-installs its hook at the start of a request when
   `Lua::set_hook` replaced it.
+- The cancel hook is installed once per VM as a Lua global hook, after the
+  init closure, and stays installed.  A hook set with `Lua::set_hook` in
+  the init closure is replaced by it.  (Previously every request replaced
+  the hook and removed it afterwards, so such a hook did not survive the
+  first request either.)  Do not set a hook with `Lua::set_hook` /
+  `Lua::set_global_hook` from inside a request (e.g. an `exec` closure):
+  it replaces the cancel hook, and cancellation stops working.  Register
+  callbacks with `hooks::add_hook` instead.
+- Coroutine requests run through `Function::call_async` instead of
+  `Thread::into_async`.
 
 ### Fixed
 - Cancelling a request now reaches coroutines that the Lua code creates
@@ -50,17 +60,6 @@
   awaiting at once, as `CancelToken::cancelled` documents, and closes the
   coroutine's pending to-be-closed variables.  Previously the future was
   kept alive until the next Lua GC cycle or shutdown (#1).
-
-### Changed
-- The cancel hook is installed once per VM as a Lua global hook, after the
-  init closure, and stays installed.  A hook set with `Lua::set_hook` in
-  the init closure is replaced by it.  (Previously every request replaced
-  the hook and removed it afterwards, so such a hook did not survive the
-  first request either.)  Do not set a hook with `Lua::set_hook` /
-  `Lua::set_global_hook` from inside a request (e.g. an `exec` closure):
-  it replaces the cancel hook, and cancellation stops working.
-- Coroutine requests run through `Function::call_async` instead of
-  `Thread::into_async`.
 
 ## [0.6.0] - 2026-09-05
 
