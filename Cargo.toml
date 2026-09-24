@@ -12,6 +12,7 @@ documentation = "https://docs.rs/mlua-isle"
 keywords = ["lua", "mlua", "thread", "async", "pool"]
 categories = ["concurrency", "api-bindings"]
 readme = "README.md"
+exclude = [".gitignore"]
 
 [features]
 default = []
