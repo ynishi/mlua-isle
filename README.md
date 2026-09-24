@@ -222,6 +222,65 @@ driver.shutdown().await?;
 # }
 ```
 
+Dropping a `Task` / `AsyncTask` before it resolves cancels the operation.
+Call `.detach()` to let it run without keeping the handle.
+
+### Structured tasks (async)
+
+`tasks::install` gives Lua code a `task` library.  Tasks are structured:
+cancelling a request cancels every task it spawned (and theirs), and a
+request does not resolve before the tasks it did not join have been
+cancelled and have finished.
+
+```rust
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use mlua_isle::hooks::{self, CancelConfig};
+use mlua_isle::{cancellable, tasks, AsyncIsle};
+use std::time::Duration;
+
+let (isle, driver) = AsyncIsle::spawn(|lua| {
+    hooks::configure(lua, CancelConfig {
+        // A cancelled coroutine may run its cleanup for up to 100 ms.
+        grace: Duration::from_millis(100),
+        // Yield CPU-bound tasks so that siblings can run and cancel them.
+        preempt_every: Some(1),
+    });
+    lua.globals().set("task", tasks::install(lua)?)?;
+    // `cancellable` turns a cancel into a Lua error at this await point,
+    // so `__close` handlers of the coroutine run and may await.
+    let sleep = lua.create_async_function(|_, ms: u64| {
+        cancellable(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok(())
+        })
+    })?;
+    lua.globals().set("sleep", sleep)
+})
+.await?;
+
+let r = isle
+    .coroutine_eval(
+        r#"
+        local a = task.spawn(function() sleep(10) return "a" end)
+        local b = task.spawn(function() error({ code = 42 }) end)
+        local _, va = a:join()           -- true, "a"
+        local _, err = b:join()          -- false, { code = 42 }
+        local slow <close> = task.spawn(function() sleep(10000) end)
+        return va .. err.code            -- `slow` is cancelled and awaited here
+        "#,
+    )
+    .await?;
+assert_eq!(r, "a42");
+driver.shutdown().await?;
+# Ok(())
+# }
+```
+
+The isle owns the VM's Lua debug hook.  Register your own hook callbacks
+with `hooks::add_hook` rather than `Lua::set_hook`, which would replace
+the cancel hook.
+
 ## API
 
 ### Sync (`Isle`)
@@ -258,6 +317,13 @@ driver.shutdown().await?;
 | `driver.shutdown().await` | Graceful shutdown (drains pending coroutines) |
 | `task.cancel()` | Cancel the running task |
 | `task.cancel_token()` | Access the `CancelToken` for sharing |
+| `task.detach()` | Let the task run without the handle (dropping it cancels) |
+| `tasks::install(lua)` | Lua `task` library: `spawn` / `join` / `cancel` / `done` |
+| `hooks::configure(lua, config)` | Cancel grace period and preemption |
+| `hooks::add_hook(lua, triggers, f)` | Register a Lua hook callback next to the cancel hook |
+| `cancellable(fut)` | Make an async host function stop at cancel |
+| `current_token()` | Token of the running request / task (derive child tokens) |
+| `run_root(lua, token, f, args)` | Run a coroutine with task support on a VM you drive |
 
 ### Pool (`IslePool`, `pool` feature)
 

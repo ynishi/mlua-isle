@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Added
+- `CancelToken::child_token` — a token cancelled together with its parent.
+  Finished children leave the parent without an explicit unregister.
+- `current_token()` — the token of the request or task currently running,
+  for host functions that start work of their own.
+- `hooks` module: the isle owns the VM's Lua debug hook and shares it.
+  `hooks::add_hook` / `hooks::remove_hook` register user callbacks next
+  to the cancel check (including in coroutines the Lua code creates);
+  `hooks::configure` sets a `CancelConfig`:
+  - `grace` — a cancelled coroutine first gets the cancellation as a Lua
+    error, so its `__close` handlers run and may await; after `grace` it
+    is dropped.  Default zero (drop at once, as before).
+  - `preempt_every` — yield CPU-bound coroutine requests and tasks
+    periodically so other tasks on the thread, including one that
+    cancels them, can run.  Coroutines the Lua code creates are never
+    yielded.  Default off.
+- `cancellable(fut)` — wrap the future of an async host function so that
+  a cancel returns a Lua error at that await point.
+- `tasks` module: a structured Lua task library (`task.spawn`,
+  `h:join()`, `h:cancel()`, `h:done()`, `task.CANCELLED`).  `join`
+  returns the raw Lua error value (tables stay tables).  A request or
+  task cancels and awaits the tasks it did not join before it resolves;
+  a `<close>` handle does the same on scope exit.
+- `run_root(lua, token, f, args)` — run a coroutine with task support on
+  a VM you drive yourself (a `LocalSet` on your own thread).
+- `Task::detach` / `AsyncTask::detach`.
+
+### Changed
+- **Breaking**: dropping a `Task` or `AsyncTask` before it resolves now
+  cancels the operation (previously it kept running, detached).  Use
+  `.detach()` for the old behaviour.  Both types are `#[must_use]`.
+- The isle re-installs its hook at the start of a request when
+  `Lua::set_hook` replaced it.
+
 ### Fixed
 - Cancelling a request now reaches coroutines that the Lua code creates
   itself (`coroutine.create` / `coroutine.wrap`).  The cancel hook was a
