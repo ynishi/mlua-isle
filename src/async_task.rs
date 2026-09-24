@@ -57,9 +57,19 @@ use std::task::{Context, Poll};
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Dropping
+///
+/// Dropping an `AsyncTask` before it resolves **cancels** the operation,
+/// like [`async_task::Task`][async-task] and tokio-util's
+/// `AbortOnDropHandle`.  Call [`detach`](AsyncTask::detach) to let it run
+/// to completion without keeping the handle.
+#[must_use = "dropping an AsyncTask cancels the operation; use `.detach()` to let it run"]
 pub struct AsyncTask<T = String> {
     rx: tokio::sync::oneshot::Receiver<Result<T, IsleError>>,
     cancel: CancelToken,
+    /// Resolved or detached: dropping must not cancel.
+    released: bool,
 }
 
 impl<T> AsyncTask<T> {
@@ -67,7 +77,19 @@ impl<T> AsyncTask<T> {
         rx: tokio::sync::oneshot::Receiver<Result<T, IsleError>>,
         cancel: CancelToken,
     ) -> Self {
-        Self { rx, cancel }
+        Self {
+            rx,
+            cancel,
+            released: false,
+        }
+    }
+
+    /// Let the operation run to completion without this handle.
+    ///
+    /// The result is discarded.  The operation can still be cancelled
+    /// through a clone of its [`cancel_token`](Self::cancel_token).
+    pub fn detach(mut self) {
+        self.released = true;
     }
 
     /// Cancel the operation.
@@ -88,7 +110,11 @@ impl<T> Future for AsyncTask<T> {
     type Output = Result<T, IsleError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.rx).poll(cx) {
+        let polled = Pin::new(&mut self.rx).poll(cx);
+        if polled.is_ready() {
+            self.released = true;
+        }
+        match polled {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
             // The oneshot sender was dropped without sending a result.
             // This happens when the Lua thread panics or shuts down while
@@ -97,6 +123,14 @@ impl<T> Future for AsyncTask<T> {
             // synchronous `Task`.
             Poll::Ready(Err(_)) => Poll::Ready(Err(IsleError::RecvFailed("oneshot closed".into()))),
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T> Drop for AsyncTask<T> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.cancel.cancel();
         }
     }
 }

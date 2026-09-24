@@ -1,13 +1,18 @@
-//! Cancellation token and Lua debug hook.
+//! Cancellation tokens and the "current token" of a Lua thread.
 //!
 //! A [`CancelToken`] is a shared `AtomicBool` that can be checked from
-//! both Rust code and a Lua debug hook.  When cancelled, the debug hook
-//! raises a Lua error containing the sentinel `__isle_cancelled__`,
-//! which is recognized by [`IsleError::from(mlua::Error)`].
+//! both Rust code and a Lua debug hook.  When the token of the request
+//! (or task) currently executing is cancelled, the cancel hook (see
+//! [`hooks`](crate::hooks)) raises a Lua error containing the sentinel
+//! `__isle_cancelled__`, which is recognized by
+//! [`IsleError::from(mlua::Error)`](crate::IsleError).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
+
+/// Sentinel message carried by the Lua error that cancellation raises.
+pub(crate) const CANCELLED_SENTINEL: &str = "__isle_cancelled__";
 
 /// Cancellation signal shared between caller and Lua thread.
 ///
@@ -15,63 +20,128 @@ use std::sync::Arc;
 ///
 /// Two cancellation pathways are wired:
 ///
-/// 1. A Lua debug hook polls [`is_cancelled`](Self::is_cancelled) every
+/// 1. A Lua debug hook checks [`is_cancelled`](Self::is_cancelled) every
 ///    `N` Lua instructions.  This interrupts pure-Lua CPU-bound loops
 ///    (`while true do end` etc), including loops inside coroutines
 ///    that the Lua code itself creates.
 ///
 /// 2. When the feature `tokio` is enabled, [`cancelled`](Self::cancelled)
 ///    provides an async signal that fires as soon as [`cancel`](Self::cancel)
-///    is called.  Coroutine executors (`execute_coroutine_eval`,
-///    `execute_coroutine_call`) use this in a `tokio::select!` to drop
-///    the in-flight Lua coroutine (built with
-///    [`Function::call_async`](mlua::Function::call_async), so the drop
-///    terminates the coroutine at once) even when it is suspended
-///    inside a Rust `.await` (e.g. a `create_async_function` awaiting a
-///    tokio child process).  The debug hook alone cannot interrupt such
-///    Rust-suspended coroutines because no Lua instructions execute
-///    during the `.await`, so the hook never fires.
+///    is called.  Coroutine executors use it to stop a Lua coroutine
+///    even when it is suspended inside a Rust `.await` (e.g. a
+///    `create_async_function` awaiting a tokio child process), a state
+///    in which the debug hook cannot fire because no Lua instructions
+///    execute.
+///
+/// # Hierarchy
+///
+/// [`child_token`](Self::child_token) derives a token that is cancelled
+/// whenever its parent is.  A parent holds its children weakly and a
+/// child holds its parent strongly: a finished child disappears from
+/// its parent without an explicit unregister, and a live grandchild
+/// keeps the chain between it and the root alive.
 #[derive(Clone)]
 pub struct CancelToken {
-    flag: Arc<AtomicBool>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    flag: AtomicBool,
     #[cfg(feature = "tokio")]
-    notify: Arc<tokio::sync::Notify>,
+    notify: tokio::sync::Notify,
+    // Kept only to hold the chain to the root alive; never read.
+    _parent: Option<Arc<Inner>>,
+    children: Mutex<Children>,
+}
+
+#[derive(Default)]
+struct Children {
+    list: Vec<Weak<Inner>>,
+    /// `list.len()` at which dead entries are swept next.
+    sweep_at: usize,
+}
+
+impl Inner {
+    fn new(parent: Option<Arc<Inner>>) -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            #[cfg(feature = "tokio")]
+            notify: tokio::sync::Notify::new(),
+            _parent: parent,
+            children: Mutex::new(Children::default()),
+        }
+    }
+
+    fn cancel(&self) {
+        if self.flag.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        #[cfg(feature = "tokio")]
+        self.notify.notify_waiters();
+        let children = std::mem::take(&mut lock(&self.children).list);
+        for child in children.iter().filter_map(Weak::upgrade) {
+            child.cancel();
+        }
+    }
+}
+
+fn lock(m: &Mutex<Children>) -> std::sync::MutexGuard<'_, Children> {
+    // A panic while holding this lock cannot leave `Children` in an
+    // inconsistent state, so a poisoned lock is still usable.
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl CancelToken {
     /// Create a new token (not cancelled).
     pub fn new() -> Self {
         Self {
-            flag: Arc::new(AtomicBool::new(false)),
-            #[cfg(feature = "tokio")]
-            notify: Arc::new(tokio::sync::Notify::new()),
+            inner: Arc::new(Inner::new(None)),
         }
+    }
+
+    /// Derive a child token.
+    ///
+    /// The child is cancelled when this token is cancelled (at once if
+    /// it already is).  Cancelling the child does not affect this
+    /// token.
+    pub fn child_token(&self) -> CancelToken {
+        let child = Arc::new(Inner::new(Some(self.inner.clone())));
+        let mut children = lock(&self.inner.children);
+        // Checked under the lock: `Inner::cancel` sets the flag before
+        // taking the lock, so either it sees this child or we see the flag.
+        if self.is_cancelled() {
+            drop(children);
+            child.cancel();
+        } else {
+            if children.list.len() >= children.sweep_at {
+                children.list.retain(|w| w.strong_count() > 0);
+                children.sweep_at = (children.list.len() * 2).max(16);
+            }
+            children.list.push(Arc::downgrade(&child));
+        }
+        CancelToken { inner: child }
     }
 
     /// Signal cancellation.
     ///
-    /// Sets the atomic flag (observed by the Lua debug hook) and, when
-    /// the `tokio` feature is enabled, notifies all waiters of the
-    /// async [`cancelled`](Self::cancelled) signal.
+    /// Sets the atomic flag (observed by the Lua debug hook), notifies
+    /// all waiters of the async [`cancelled`](Self::cancelled) signal
+    /// when the `tokio` feature is enabled, and cancels every live
+    /// child token.
     pub fn cancel(&self) {
-        self.flag.store(true, Ordering::Release);
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        self.inner.cancel();
     }
 
     /// Check whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
+        self.inner.flag.load(Ordering::Acquire)
     }
 
     /// Await cancellation (async).
     ///
     /// Returns immediately if already cancelled; otherwise resolves
-    /// when [`cancel`](Self::cancel) is called.  Intended for use in
-    /// `tokio::select!` to race a Lua coroutine against its cancel
-    /// signal — when this future wins, dropping the other branch
-    /// releases any Rust async resources (e.g. a spawned child
-    /// process) that the coroutine was awaiting.
+    /// when [`cancel`](Self::cancel) is called on this token or one of
+    /// its ancestors.
     ///
     /// Race-free: the returned future is registered with the
     /// underlying [`tokio::sync::Notify`] via
@@ -84,7 +154,7 @@ impl CancelToken {
         if self.is_cancelled() {
             return;
         }
-        let notified = self.notify.notified();
+        let notified = self.inner.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
         // Re-check after enabling: a cancel() that happened between
@@ -96,6 +166,20 @@ impl CancelToken {
         }
         notified.await;
     }
+
+    #[cfg(test)]
+    fn live_children(&self) -> usize {
+        lock(&self.inner.children)
+            .list
+            .iter()
+            .filter(|w| w.strong_count() > 0)
+            .count()
+    }
+
+    #[cfg(test)]
+    fn stored_children(&self) -> usize {
+        lock(&self.inner.children).list.len()
+    }
 }
 
 impl Default for CancelToken {
@@ -104,12 +188,34 @@ impl Default for CancelToken {
     }
 }
 
+impl std::fmt::Debug for CancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
 thread_local! {
-    /// Token of the request currently executing on this Lua thread.
-    ///
-    /// Each isle owns a dedicated OS thread, so a thread-local is
-    /// equivalent to per-VM state.  The global cancel hook reads it.
+    /// Token of the request (or task) currently executing on this Lua
+    /// thread.  The cancel hook reads it.
     static CURRENT: RefCell<Option<CancelToken>> = const { RefCell::new(None) };
+}
+
+/// Token of the request or task currently executing on this thread.
+///
+/// Inside a host function called from Lua code that an isle runs, this
+/// is the token of that request (for coroutine requests and tasks, the
+/// one being polled).  Use it to derive a [`child_token`](CancelToken::child_token)
+/// for work the host function starts, so that cancelling the request
+/// reaches that work too.  Returns `None` outside such a context.
+pub fn current_token() -> Option<CancelToken> {
+    CURRENT.with(|c| c.borrow().clone())
+}
+
+/// Whether the current token is cancelled.
+pub(crate) fn current_is_cancelled() -> bool {
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(CancelToken::is_cancelled))
 }
 
 /// RAII guard that makes `token` the current token of this thread.
@@ -133,79 +239,6 @@ impl Drop for EnterGuard {
     }
 }
 
-/// Install the cancel hook as a Lua **global** hook.
-///
-/// Called once per VM, after the user's init closure.  The hook
-/// raises a Lua error with a sentinel message that
-/// [`IsleError`](crate::IsleError) recognizes as a cancellation when
-/// the token of the request currently executing on this thread (see
-/// [`EnterGuard`]) is cancelled.
-///
-/// # Why a global hook
-///
-/// A per-thread hook ([`mlua::Lua::set_hook`] /
-/// [`mlua::Thread::set_hook`]) does not reach coroutines created
-/// from Lua (`coroutine.create` / `coroutine.wrap`): Lua copies the C
-/// hook into the new thread, but mlua finds no callback registered
-/// for that thread and removes the hook the first time it fires.  A
-/// CPU loop inside such a coroutine could then never be cancelled.
-/// The global hook's callback is shared by every thread of the VM.
-///
-/// # Instruction interval
-///
-/// The `interval` controls how often the check runs.  Lower values
-/// give faster cancellation response at the cost of overhead.
-/// A value of 1000 is a reasonable default.
-pub(crate) fn install_cancel_hook(lua: &mlua::Lua, interval: u32) -> Result<(), crate::IsleError> {
-    lua.set_global_hook(
-        mlua::HookTriggers::new().every_nth_instruction(interval),
-        |_lua, _debug| {
-            let cancelled =
-                CURRENT.with(|c| c.borrow().as_ref().is_some_and(CancelToken::is_cancelled));
-            if cancelled {
-                Err(mlua::Error::runtime("__isle_cancelled__"))
-            } else {
-                Ok(mlua::VmState::Continue)
-            }
-        },
-    )
-    .map_err(crate::IsleError::from)
-}
-
-/// Future adapter that makes `token` the current token while the
-/// inner future is polled.
-///
-/// Coroutine requests interleave on one Lua thread, so the current
-/// token must be switched on every poll rather than once per request.
-#[cfg(feature = "tokio")]
-pub(crate) struct Scoped<F> {
-    token: CancelToken,
-    fut: std::pin::Pin<Box<F>>,
-}
-
-#[cfg(feature = "tokio")]
-impl<F> Scoped<F> {
-    pub(crate) fn new(token: CancelToken, fut: F) -> Self {
-        Self {
-            token,
-            fut: Box::pin(fut),
-        }
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl<F: std::future::Future> std::future::Future for Scoped<F> {
-    type Output = F::Output;
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<F::Output> {
-        let _enter = EnterGuard::new(&self.token);
-        self.fut.as_mut().poll(cx)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,66 +258,68 @@ mod tests {
     }
 
     #[test]
-    fn hook_interrupts_lua_loop() {
-        let lua = mlua::Lua::new();
-        let token = CancelToken::new();
-        install_cancel_hook(&lua, 100).unwrap();
-        let _enter = EnterGuard::new(&token);
+    fn cancel_reaches_descendants_not_ancestors() {
+        let root = CancelToken::new();
+        let child = root.child_token();
+        let grandchild = child.child_token();
+        let sibling = root.child_token();
 
-        // Schedule cancel after a short spin
-        let t = token.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            t.cancel();
-        });
+        child.cancel();
+        assert!(child.is_cancelled());
+        assert!(grandchild.is_cancelled());
+        assert!(!root.is_cancelled());
+        assert!(!sibling.is_cancelled());
 
-        let result: mlua::Result<()> = lua.load("while true do end").exec();
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("__isle_cancelled__"),
-            "expected cancellation sentinel, got: {err_msg}"
-        );
+        root.cancel();
+        assert!(sibling.is_cancelled());
     }
 
     #[test]
-    fn hook_interrupts_loop_in_lua_created_coroutine() {
-        let lua = mlua::Lua::new();
-        let token = CancelToken::new();
-        install_cancel_hook(&lua, 100).unwrap();
-        let _enter = EnterGuard::new(&token);
-
-        let t = token.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            t.cancel();
-        });
-
-        let result: mlua::Result<()> = lua
-            .load("coroutine.wrap(function() while true do end end)()")
-            .exec();
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("__isle_cancelled__"),
-            "expected cancellation sentinel, got: {err_msg}"
-        );
+    fn child_of_cancelled_token_starts_cancelled() {
+        let root = CancelToken::new();
+        root.cancel();
+        assert!(root.child_token().is_cancelled());
     }
 
     #[test]
-    fn hook_ignores_cancelled_token_that_is_not_current() {
-        let lua = mlua::Lua::new();
-        install_cancel_hook(&lua, 100).unwrap();
-        let other = CancelToken::new();
-        other.cancel();
-        {
-            let _outer = EnterGuard::new(&other);
-            let _inner = EnterGuard::new(&CancelToken::new());
-            let r: i64 = lua
-                .load("local n = 0 for i = 1, 100000 do n = n + 1 end return n")
-                .eval()
-                .unwrap();
-            assert_eq!(r, 100000);
+    fn grandchild_stays_reachable_after_middle_handle_is_dropped() {
+        let root = CancelToken::new();
+        let grandchild = root.child_token().child_token();
+        root.cancel();
+        assert!(grandchild.is_cancelled());
+    }
+
+    #[test]
+    fn dropped_children_are_swept() {
+        let root = CancelToken::new();
+        let keep = root.child_token();
+        for _ in 0..10_000 {
+            let _ = root.child_token();
         }
-        assert!(CURRENT.with(|c| c.borrow().is_none()));
+        assert_eq!(root.live_children(), 1);
+        assert!(
+            root.stored_children() <= 32,
+            "dead children were not swept: {}",
+            root.stored_children()
+        );
+        root.cancel();
+        assert!(keep.is_cancelled());
+    }
+
+    #[test]
+    fn current_token_follows_enter_guards() {
+        assert!(current_token().is_none());
+        let outer = CancelToken::new();
+        let inner = CancelToken::new();
+        {
+            let _o = EnterGuard::new(&outer);
+            {
+                let _i = EnterGuard::new(&inner);
+                inner.cancel();
+                assert!(current_is_cancelled());
+            }
+            assert!(!current_is_cancelled());
+        }
+        assert!(current_token().is_none());
     }
 }

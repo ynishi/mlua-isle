@@ -4,11 +4,9 @@
 
 use crate::error::IsleError;
 use crate::hook;
+use crate::hooks;
 use crate::Request;
 use std::sync::mpsc;
-
-/// Instruction check interval for the cancel hook.
-pub(crate) const HOOK_INTERVAL: u32 = 1000;
 
 /// Run the Lua event loop on the current thread.
 ///
@@ -44,6 +42,7 @@ pub(crate) fn execute_eval(
     code: &str,
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
+    hooks::ensure_installed(lua)?;
     let _enter = hook::EnterGuard::new(cancel);
     let result: mlua::Result<mlua::Value> = lua.load(code).eval();
 
@@ -58,6 +57,7 @@ pub(crate) fn execute_exec(
     f: impl FnOnce(&mlua::Lua) -> Result<String, IsleError>,
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
+    hooks::ensure_installed(lua)?;
     let _enter = hook::EnterGuard::new(cancel);
     f(lua)
 }
@@ -68,6 +68,7 @@ pub(crate) fn execute_call(
     args: &[String],
     cancel: &hook::CancelToken,
 ) -> Result<String, IsleError> {
+    hooks::ensure_installed(lua)?;
     let _enter = hook::EnterGuard::new(cancel);
 
     let func: mlua::Function = lua
