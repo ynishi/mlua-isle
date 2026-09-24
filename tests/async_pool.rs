@@ -630,4 +630,3 @@ async fn scenario_lifecycle_kill_then_warm_reuse() {
 
     pool.shutdown().await;
 }
-
