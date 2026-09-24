@@ -75,16 +75,16 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mlua-isle = "0.4"
+mlua-isle = "0.7"
 
 # For async support (includes coroutine execution):
-# mlua-isle = { version = "0.4", features = ["tokio"] }
+# mlua-isle = { version = "0.7", features = ["tokio"] }
 
 # For connection pool:
-# mlua-isle = { version = "0.4", features = ["pool"] }
+# mlua-isle = { version = "0.7", features = ["pool"] }
 
 # Both:
-# mlua-isle = { version = "0.4", features = ["tokio", "pool"] }
+# mlua-isle = { version = "0.7", features = ["tokio", "pool"] }
 ```
 
 ### Sync API
