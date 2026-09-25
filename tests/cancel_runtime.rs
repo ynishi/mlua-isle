@@ -213,7 +213,10 @@ async fn cancelling_the_request_reaches_grandchildren() {
     let cancelled_at = Instant::now();
     task.cancel();
     assert_eq!(within(1000, task).await.unwrap_err(), IsleError::Cancelled);
+    let resolved_at = Instant::now();
 
+    // The drops happen on the isle thread before the result is sent, so
+    // all three are recorded by the time the request resolves.
     let drops = drops.lock().unwrap().clone();
     let mut names: Vec<_> = drops.iter().map(|(n, _)| n.as_str()).collect();
     names.sort();
@@ -222,6 +225,10 @@ async fn cancelling_the_request_reaches_grandchildren() {
         assert!(
             at.duration_since(cancelled_at) < Duration::from_millis(100),
             "{name} dropped late"
+        );
+        assert!(
+            *at <= resolved_at,
+            "{name} dropped after the request resolved"
         );
     }
     driver.shutdown().await.unwrap();
@@ -560,4 +567,158 @@ fn run_root_drives_tasks_on_a_vm_you_own() {
         .and_then(|v| v.as_i64())
         .unwrap();
     assert_eq!(v, 42);
+}
+
+// ── cancelling run_root waits for the tasks it spawned ──
+
+/// Timeline of one cancelled [`mlua_isle::run_root`] call.
+struct CancelledRoot {
+    out: Result<mlua::MultiValue, IsleError>,
+    cancelled_at: Instant,
+    resolved_at: Instant,
+    /// `("drop", t)` when an `hsleep` future was dropped, `("second", t)`
+    /// when the second root's body ran.
+    log: Vec<(&'static str, Instant)>,
+}
+
+/// On a VM driven by its own current-thread runtime and `LocalSet`, run
+/// `src` under `run_root`, cancel it after 50 ms, and (when `second` is
+/// given) run `second` under a fresh `run_root` right after the first
+/// one resolved.
+///
+/// `hsleep()` holds the host future for 1000 ms and is not
+/// `cancellable`: only dropping its future releases it.  `mark()`
+/// records that the second root ran.
+fn cancel_run_root(config: CancelConfig, src: &str, second: Option<&str>) -> CancelledRoot {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let lua = mlua::Lua::new();
+    hooks::install(&lua).unwrap();
+    hooks::configure(&lua, config);
+    lua.globals()
+        .set("task", tasks::install(&lua).unwrap())
+        .unwrap();
+    let log: Arc<Mutex<Vec<(&'static str, Instant)>>> = Default::default();
+
+    let l = log.clone();
+    let hsleep = lua
+        .create_async_function(move |_, ()| {
+            let l = l.clone();
+            async move {
+                struct Guard(Arc<Mutex<Vec<(&'static str, Instant)>>>);
+                impl Drop for Guard {
+                    fn drop(&mut self) {
+                        self.0.lock().unwrap().push(("drop", Instant::now()));
+                    }
+                }
+                let _g = Guard(l);
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                Ok(())
+            }
+        })
+        .unwrap();
+    lua.globals().set("hsleep", hsleep).unwrap();
+    let l = log.clone();
+    let mark = lua
+        .create_function(move |_, ()| {
+            l.lock().unwrap().push(("second", Instant::now()));
+            Ok(())
+        })
+        .unwrap();
+    lua.globals().set("mark", mark).unwrap();
+
+    let f: mlua::Function = lua.load(src).into_function().unwrap();
+    let g: Option<mlua::Function> = second.map(|s| lua.load(s).into_function().unwrap());
+
+    local.block_on(&rt, async {
+        let token = CancelToken::new();
+        let t = token.clone();
+        let canceller = tokio::task::spawn_local(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let at = Instant::now();
+            t.cancel();
+            at
+        });
+        let out = mlua_isle::run_root(&lua, token, f, mlua::MultiValue::new()).await;
+        let resolved_at = Instant::now();
+        if let Some(g) = g {
+            mlua_isle::run_root(&lua, CancelToken::new(), g, mlua::MultiValue::new())
+                .await
+                .unwrap();
+        }
+        let cancelled_at = canceller.await.unwrap();
+        CancelledRoot {
+            out,
+            cancelled_at,
+            resolved_at,
+            log: log.lock().unwrap().clone(),
+        }
+    })
+}
+
+const GRANDCHILD: &str = "local c = task.spawn(function()
+       local g = task.spawn(function() return hsleep() end)
+       return g:join()
+     end)
+     return c:join()";
+const CHILD: &str = "local c = task.spawn(function() return hsleep() end)
+     return c:join()";
+
+/// The `hsleep` future was dropped once, before `run_root` resolved;
+/// returns how long after the cancel.
+fn assert_dropped_before_resolve(r: &CancelledRoot) -> Duration {
+    assert_eq!(r.out.as_ref().unwrap_err(), &IsleError::Cancelled);
+    let drops: Vec<_> = r.log.iter().filter(|(n, _)| *n == "drop").collect();
+    assert_eq!(drops.len(), 1, "log: {:?}", r.log);
+    let drop_at = drops[0].1;
+    assert!(
+        drop_at <= r.resolved_at,
+        "run_root resolved {:?} before the host future was dropped",
+        drop_at.duration_since(r.resolved_at)
+    );
+    drop_at.duration_since(r.cancelled_at)
+}
+
+#[test]
+fn cancelling_run_root_waits_for_a_grandchild_to_drop() {
+    let r = cancel_run_root(CancelConfig::default(), GRANDCHILD, None);
+    let waited = assert_dropped_before_resolve(&r);
+    assert!(
+        waited < Duration::from_millis(500),
+        "dropped after {waited:?}"
+    );
+}
+
+#[test]
+fn cancelling_run_root_waits_for_a_child_to_drop() {
+    let r = cancel_run_root(CancelConfig::default(), CHILD, None);
+    let waited = assert_dropped_before_resolve(&r);
+    assert!(
+        waited < Duration::from_millis(500),
+        "dropped after {waited:?}"
+    );
+}
+
+#[test]
+fn a_second_run_root_starts_after_the_first_ones_tasks_dropped() {
+    let r = cancel_run_root(CancelConfig::default(), GRANDCHILD, Some("mark()"));
+    let order: Vec<_> = r.log.iter().map(|(n, _)| *n).collect();
+    assert_eq!(order, ["drop", "second"]);
+}
+
+#[test]
+fn cancelling_run_root_with_grace_still_waits_for_the_grandchild() {
+    let config = CancelConfig {
+        grace: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let r = cancel_run_root(config, GRANDCHILD, None);
+    let waited = assert_dropped_before_resolve(&r);
+    assert!(
+        waited >= Duration::from_millis(90) && waited < Duration::from_millis(400),
+        "dropped after {waited:?}"
+    );
 }

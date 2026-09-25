@@ -229,8 +229,9 @@ Call `.detach()` to let it run without keeping the handle.
 
 `tasks::install` gives Lua code a `task` library.  Tasks are structured:
 cancelling a request cancels every task it spawned (and theirs), and a
-request does not resolve before the tasks it did not join have been
-cancelled and have finished.
+request, whether it finishes or is cancelled, does not resolve before
+the tasks it did not join have been cancelled and have finished or been
+dropped.
 
 ```rust
 # #[tokio::main]

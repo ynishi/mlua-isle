@@ -15,7 +15,9 @@
 //! the tasks it spawned and did not join are cancelled, and it waits
 //! for them before its own result is delivered.  Cancelling a request
 //! or task cancels all of its tasks (their tokens are
-//! [children](crate::CancelToken::child_token) of its token).
+//! [children](crate::CancelToken::child_token) of its token), and the
+//! cancelled request or task still resolves only after they, and their
+//! own tasks, have finished or been dropped.
 //!
 //! `task.spawn` works inside coroutine requests
 //! ([`AsyncIsle::coroutine_eval`](crate::AsyncIsle::coroutine_eval) /
@@ -134,18 +136,19 @@ pub fn install(lua: &Lua) -> mlua::Result<Table> {
             .ok_or_else(|| mlua::Error::runtime("task.spawn: no current cancel token"))?;
         let token = parent.child_token();
         let state = Rc::new(TaskState::new(token.clone()));
+        let grace = crate::hooks::config(lua).grace;
         let run = scope::scoped_call(
             lua,
             token.clone(),
+            grace,
             WRAP_PCALL,
             f,
             MultiValue::from_iter(args),
         )?;
-        let grace = crate::hooks::config(lua).grace;
         let st = state.clone();
         let handle = tokio::task::spawn_local(async move {
             let finish = FinishOnDrop(st.clone());
-            let out = scope::with_grace(&token, grace, run).await;
+            let out = run.await;
             let outcome = match out {
                 None => Outcome::Cancelled,
                 Some(Ok(values)) => {

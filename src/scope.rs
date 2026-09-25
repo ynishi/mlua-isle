@@ -199,17 +199,23 @@ impl Drop for AbortOnDrop {
 /// Call `func` with `args` in a new coroutine that runs in its own scope
 /// under `token`.  `wrap` is [`WRAP_CALL`] or [`WRAP_PCALL`].
 ///
-/// The returned future resolves after the coroutine has finished and
-/// the tasks it spawned (and did not join) have been cancelled and
-/// have finished.  Dropping it early drops the coroutine and aborts
-/// those tasks.
+/// Once `token` is cancelled, the coroutine gets `grace` to finish and
+/// is then dropped; the future yields `None` in that case.
+///
+/// Either way, the returned future resolves only after the tasks the
+/// coroutine spawned (and did not join) have been cancelled and have
+/// finished or been dropped.  Each of those tasks waits for its own
+/// tasks the same way, so the wait covers the whole tree.  Dropping the
+/// returned future early drops the coroutine and aborts those tasks
+/// without waiting.
 pub(crate) fn scoped_call(
     lua: &Lua,
     token: CancelToken,
+    grace: Duration,
     wrap: &str,
     func: Function,
     args: MultiValue,
-) -> mlua::Result<impl Future<Output = mlua::Result<MultiValue>>> {
+) -> mlua::Result<impl Future<Output = Option<mlua::Result<MultiValue>>>> {
     let root = Rc::new(Cell::new(None));
     let r = root.clone();
     let mark = lua.create_function(move |lua, ()| {
@@ -221,7 +227,7 @@ pub(crate) fn scoped_call(
     let body: Function = lua.load(wrap).call((mark, func))?;
     let scope = Rc::new(Scope::default());
     let run = Scoped {
-        token,
+        token: token.clone(),
         scope: scope.clone(),
         root,
         fut: Box::pin(body.call_async::<MultiValue>(args)),
@@ -230,7 +236,12 @@ pub(crate) fn scoped_call(
         // No task can be spawned before the first poll, so the guard is
         // created here rather than outside the future.
         let guard = AbortOnDrop(Some(scope.clone()));
-        let out = run.await;
+        // On timeout this drops `run` (the coroutine) but not the scope.
+        // The tasks are not aborted here: aborting a task drops its
+        // future before it waits for its own tasks.  Their tokens are
+        // children of `token`, so they were cancelled with it, and each
+        // one ends after its own grace and its own wait.
+        let out = with_grace(&token, grace, run).await;
         scope.cancel_all();
         scope.wait_all().await;
         guard.disarm();
@@ -240,11 +251,7 @@ pub(crate) fn scoped_call(
 
 /// Run `fut`; once `token` is cancelled, give it `grace` to finish and
 /// then drop it.  Returns `None` when it was dropped.
-pub(crate) async fn with_grace<F: Future>(
-    token: &CancelToken,
-    grace: Duration,
-    fut: F,
-) -> Option<F::Output> {
+async fn with_grace<F: Future>(token: &CancelToken, grace: Duration, fut: F) -> Option<F::Output> {
     tokio::pin!(fut);
     tokio::select! {
         biased;
@@ -312,6 +319,15 @@ where
 ///
 /// Resolves to `Err(IsleError::Cancelled)` if `token` was cancelled,
 /// whatever the coroutine returned.
+///
+/// On cancel, the coroutine gets the grace period and is then dropped,
+/// and this resolves only after the tasks it spawned, transitively,
+/// have finished or been dropped (each after its own grace period).
+/// So nothing the cancelled call started is still alive when the next
+/// call on the VM begins.  A task in a CPU loop cannot be dropped until
+/// it yields; without
+/// [`CancelConfig::preempt_every`](crate::hooks::CancelConfig::preempt_every)
+/// the wait blocks on it.
 pub async fn run_root(
     lua: &Lua,
     token: CancelToken,
@@ -320,8 +336,7 @@ pub async fn run_root(
 ) -> Result<MultiValue, crate::IsleError> {
     hooks::ensure_installed(lua)?;
     let grace = hooks::config(lua).grace;
-    let run = scoped_call(lua, token.clone(), WRAP_CALL, func, args)?;
-    let out = with_grace(&token, grace, run).await;
+    let out = scoped_call(lua, token.clone(), grace, WRAP_CALL, func, args)?.await;
     if token.is_cancelled() {
         return Err(crate::IsleError::Cancelled);
     }
