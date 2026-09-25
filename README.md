@@ -232,10 +232,10 @@ cancelling a request cancels every task it spawned (and theirs), and a
 request, whether it finishes or is cancelled, does not resolve before
 the tasks it did not join have been cancelled and have finished or been
 dropped.  The cancel grace period is one deadline for the request and
-all of its tasks.  Work a host function starts with its own
-`spawn_local` is not waited for; run it inside an async function's
-future instead.  Dropping a `run_root` future (rather than cancelling
-its token and awaiting it) only schedules its tasks for abort.
+all of its tasks.  Host code joins the same structure through
+`runtime::current_scope()` (see [Host tasks](#host-tasks-in-the-requests-scope)).
+Dropping a `run_root` future (rather than cancelling its token and
+awaiting it) only schedules its tasks for abort.
 
 ```rust
 # #[tokio::main]
@@ -303,14 +303,66 @@ lua.globals().set("task", vm.task_lib()?)?;
 let out = local.run_until(vm.run(&token, main, ())).await?;
 ```
 
-`vm.run` resolves only after every Lua task the root spawned has ended,
-and returns `Err(IsleError::Cancelled)` once `token` is cancelled (Ctrl-C,
+`vm.run` resolves only after every task the root started has ended (Lua
+tasks, and host tasks spawned through `current_scope()`, below), and
+returns `Err(IsleError::Cancelled)` once `token` is cancelled (Ctrl-C,
 a timeout, a hook callback).  The `task` table is never set as a global
 by the crate.  `vm.config()` / `vm.set_config()` read and write the one
 `Config` of the VM, and `vm.add_hook` registers hook callbacks next to
 the cancel check.  An `AsyncIsle` takes the same `Config` through
 `AsyncIsle::builder().config(..)`; the pools have no such setting yet,
 so configure their VMs from the factory closure.
+
+### Host tasks in the request's scope
+
+A host function that starts work of its own spawns it into the scope of
+the running request or task.  The task is then structured like a
+`task.spawn` task: it is cancelled when the request ends or is
+cancelled, gets the grace (the same deadline as the rest of the tree),
+is dropped when the grace ends even if it never looks at its token, and
+the request resolves only after it is gone.  This works on the
+`AsyncIsle` path and on `vm.run` / `run_root`.
+
+```rust
+use mlua_isle::runtime::current_scope;
+
+let bg = lua.create_function(move |_, ()| {
+    // Take the handle here, in the synchronous part, and move it into
+    // the future.  `None` in a sync request (`eval` / `call` / `exec`).
+    let scope = current_scope().expect("inside a coroutine request");
+    scope
+        .spawn_local(async move {
+            // current_token() is this task's token here, and
+            // `cancellable` works.
+            poll_something().await
+        })
+        .detach(); // fire and forget; still cancelled and waited for
+    Ok(())
+})?;
+```
+
+`spawn_local` returns a `ScopedTask`, a future of `Result<T, IsleError>`
+(`Err(Cancelled)` if the task was cancelled before it finished).  Three
+ways to let go of it:
+
+- **await it** to wait for the value;
+- **keep it** for as long as the task should run: dropping it cancels
+  the task now (without waiting; the scope still waits for it);
+- **`detach()` it** to let the task run on without a handle: it is still
+  cancelled, given the grace, dropped and waited for when the request or
+  task that owns the scope ends or is cancelled.
+
+Inside a host task, `current_scope()` is that task's own scope, so
+tasks it spawns are waited for by it.  Tasks spawned into a scope that
+is already ending share its remaining time, and a spawn after that time
+is gone starts nothing.  A panic in a host future
+is caught by tokio and its `ScopedTask` resolves to `Err(Cancelled)`.
+
+`current_token().child_token()` plus a bare `tokio::task::spawn_local`
+gives cancellation only: the request neither waits for that task nor
+drops it, so a host future that does not watch its token keeps running
+next to the next request on the VM, and keeps `driver.shutdown()` from
+returning.
 
 ## API
 

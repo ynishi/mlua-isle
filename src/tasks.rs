@@ -24,8 +24,9 @@
 //!
 //! `task.spawn` works inside coroutine requests
 //! ([`AsyncIsle::coroutine_eval`](crate::AsyncIsle::coroutine_eval) /
-//! [`coroutine_call`](crate::AsyncIsle::coroutine_call)), inside tasks,
-//! and inside [`run_root`](crate::run_root).  Sync requests (`eval` /
+//! [`coroutine_call`](crate::AsyncIsle::coroutine_call)), inside tasks
+//! (including host tasks), and inside [`run_root`](crate::run_root) /
+//! [`Vm::run`](crate::runtime::Vm::run).  Sync requests (`eval` /
 //! `call` / `exec`) cannot await, so `task.spawn` raises an error there.
 //!
 //! A task that runs a CPU loop never yields on its own, so a sibling on
@@ -34,15 +35,32 @@
 //! for that.  Cancelling from another thread (an [`AsyncTask`](crate::AsyncTask)
 //! handle) works without it.
 //!
-//! A host function that starts work of its own with
-//! [`current_token()`](crate::current_token)`.child_token()` and
-//! `spawn_local` gets cancellation, but the request does not wait for
-//! that work before it resolves.  To have the request wait, do the work
-//! inside the future of a
-//! [`create_async_function`](mlua::Lua::create_async_function), so the
-//! coroutine awaits it.
+//! # Host tasks
+//!
+//! Host code adds a task to the same scope with
+//! [`runtime::current_scope`](crate::runtime::current_scope) and
+//! [`ScopeHandle::spawn_local`](crate::runtime::ScopeHandle::spawn_local):
+//! the host future is structured like a `task.spawn` task (cancelled
+//! with its request or task, given the same grace deadline, dropped
+//! when the grace ends, waited for), and inside it
+//! [`current_token`](crate::current_token), `cancellable` and
+//! `current_scope` refer to the host task itself.  Take the handle in
+//! the synchronous part of the host function and move it into the
+//! future.  The returned [`ScopedTask`](crate::runtime::ScopedTask) can
+//! be awaited (wait for the value), kept (dropping it cancels the task
+//! now), or [detached](crate::runtime::ScopedTask::detach) (the task
+//! runs on without a handle and is still cancelled, dropped and waited
+//! for when its scope ends).
+//!
+//! [`current_token()`](crate::current_token)`.child_token()` with a bare
+//! `tokio::task::spawn_local` gives cancellation only: the request
+//! neither waits for that task nor drops it, so a host future that does
+//! not watch the token keeps running after the request resolved (next
+//! to the next request on the VM, and keeping an
+//! [`AsyncIsleDriver::shutdown`](crate::AsyncIsleDriver::shutdown) from
+//! returning).
 
-use crate::scope::{self, FinishOnDrop, Outcome, TaskState, WRAP_PCALL};
+use crate::scope::{self, Spawned, WRAP_PCALL};
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -90,12 +108,12 @@ return task
 
 #[derive(Default)]
 struct Registry {
-    tasks: RefCell<HashMap<u64, Rc<TaskState>>>,
+    tasks: RefCell<HashMap<u64, Spawned<MultiValue>>>,
     next_id: Cell<u64>,
 }
 
 impl Registry {
-    fn get(&self, id: u64) -> mlua::Result<Rc<TaskState>> {
+    fn get(&self, id: u64) -> mlua::Result<Spawned<MultiValue>> {
         self.tasks
             .borrow()
             .get(&id)
@@ -138,57 +156,37 @@ pub fn install(lua: &Lua) -> mlua::Result<Table> {
 
     let r = reg.clone();
     let spawn_raw = lua.create_function(move |lua, (f, args): (Function, Variadic<Value>)| {
-        let scope = scope::current_scope().ok_or_else(|| {
+        let scope = scope::current().ok_or_else(|| {
             mlua::Error::runtime(
                 "task.spawn: not inside a coroutine request or task (sync requests cannot spawn)",
             )
         })?;
-        let parent = crate::hook::current_token()
-            .ok_or_else(|| mlua::Error::runtime("task.spawn: no current cancel token"))?;
-        let token = parent.child_token();
-        let state = Rc::new(TaskState::new(token.clone()));
         let grace = crate::hooks::config(lua).grace;
-        let run = scope::scoped_call(
-            lua,
-            token.clone(),
-            grace,
-            Some(scope.clone()),
-            WRAP_PCALL,
-            f,
-            MultiValue::from_iter(args),
-        )?;
-        let st = state.clone();
-        let handle = tokio::task::spawn_local(async move {
-            let finish = FinishOnDrop(st.clone());
-            let out = run.await;
-            let outcome = match out {
-                None => Outcome::Cancelled,
-                Some(Ok(values)) => {
-                    let failed = matches!(values.front(), Some(Value::Boolean(false)));
-                    if failed && token.is_cancelled() {
-                        Outcome::Cancelled
-                    } else {
-                        Outcome::Values(values)
-                    }
+        let (root, body) = scope::lua_body(lua, WRAP_PCALL, f, MultiValue::from_iter(args))?;
+        // `None` in the result slot means cancelled.
+        let task = scope.spawn(grace, Some(root), body, |out, token| match out {
+            None => None,
+            Some(Ok(values)) => {
+                let failed = matches!(values.front(), Some(Value::Boolean(false)));
+                if failed && token.is_cancelled() {
+                    None
+                } else {
+                    Some(values)
                 }
-                Some(Err(e)) if token.is_cancelled() => {
-                    drop(e);
-                    Outcome::Cancelled
-                }
-                Some(Err(e)) => Outcome::Values(MultiValue::from_vec(vec![
-                    Value::Boolean(false),
-                    scope::error_value(e),
-                ])),
-            };
-            st.finish(outcome);
-            drop(finish);
+            }
+            Some(Err(e)) if token.is_cancelled() => {
+                drop(e);
+                None
+            }
+            Some(Err(e)) => Some(MultiValue::from_vec(vec![
+                Value::Boolean(false),
+                scope::error_value(e),
+            ])),
         });
-        *state.abort.borrow_mut() = Some(handle.abort_handle());
-        scope.add(state.clone());
 
         let id = r.next_id.get();
         r.next_id.set(id + 1);
-        r.tasks.borrow_mut().insert(id, state);
+        r.tasks.borrow_mut().insert(id, task);
         Ok(id)
     })?;
 
@@ -198,31 +196,30 @@ pub fn install(lua: &Lua) -> mlua::Result<Table> {
         let r = r.clone();
         let marker = marker.clone();
         async move {
-            let state = r.get(id)?;
-            state.wait_done().await;
+            let task = r.get(id)?;
+            task.state.wait_done().await;
             r.tasks.borrow_mut().remove(&id);
-            Ok(match state.take_outcome() {
-                Some(Outcome::Values(values)) => values,
-                Some(Outcome::Cancelled) | None => {
-                    MultiValue::from_vec(vec![Value::Boolean(false), Value::Table(marker)])
-                }
+            let out = task.result.borrow_mut().take();
+            Ok(match out {
+                Some(values) => values,
+                None => MultiValue::from_vec(vec![Value::Boolean(false), Value::Table(marker)]),
             })
         }
     })?;
 
     let r = reg.clone();
     let cancel_raw = lua.create_function(move |_, id: u64| {
-        r.get(id)?.token.cancel();
+        r.get(id)?.state.token.cancel();
         Ok(())
     })?;
 
     let r = reg.clone();
-    let done_raw = lua.create_function(move |_, id: u64| Ok(r.get(id)?.is_done()))?;
+    let done_raw = lua.create_function(move |_, id: u64| Ok(r.get(id)?.state.is_done()))?;
 
     let r = reg;
     let release_raw = lua.create_function(move |_, id: u64| {
-        if let Some(state) = r.tasks.borrow_mut().remove(&id) {
-            state.token.cancel();
+        if let Some(task) = r.tasks.borrow_mut().remove(&id) {
+            task.state.token.cancel();
         }
         Ok(())
     })?;

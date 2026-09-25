@@ -10,9 +10,9 @@
 //! [`Vm`] is the entry point: [`Vm::attach`] takes over the VM's debug
 //! hook, stores its [`Config`] and creates the `task` library.  The
 //! hook part (`attach`, `of`, `config`, `set_config`, `add_hook`,
-//! `remove_hook`) is always available; `Vm::run`, `Vm::task_lib` and
-//! `cancellable` need the `tokio` feature.  With it, setup is three
-//! calls (see `Vm::run` for the full example):
+//! `remove_hook`) is always available; `Vm::run`, `Vm::task_lib`,
+//! `cancellable` and `current_scope` need the `tokio` feature.  With
+//! it, setup is three calls (see `Vm::run` for the full example):
 //!
 //! ```text
 //! let vm = Vm::attach(&lua, Config { grace: Duration::from_secs(1), ..Default::default() })?;
@@ -23,15 +23,21 @@
 //! # Contracts
 //!
 //! 1. **When `run` resolves, nothing the root started is alive.**  This
-//!    holds for Lua tasks (`task.spawn`), transitively, whether the root
-//!    finished or was cancelled.  Host tasks are not covered yet: a
-//!    host function that starts work with its own `spawn_local` is not
-//!    waited for (scoped host tasks are a follow-up, issue #8).  The
-//!    layer does not drain the host's `LocalSet`.  This holds when
-//!    `run` is awaited to the end: dropping the `run` future instead
-//!    only schedules the tasks for abort, and a task in a CPU loop
-//!    blocks `run` until it yields, which without
-//!    [`Config::preempt_every`] it never does.
+//!    holds for Lua tasks (`task.spawn`) and for host tasks spawned
+//!    through the scope (`current_scope()` then
+//!    `ScopeHandle::spawn_local`), transitively and in any mix,
+//!    whether the root finished or was cancelled.  A host task that
+//!    ignores its token is dropped when the grace ends.  Tasks spawned
+//!    into a scope that is already ending share its remaining time; a
+//!    spawn after the remaining time is gone starts nothing.  The layer
+//!    does not drain the host's `LocalSet`: a `spawn_local` that bypasses the
+//!    scope (for example `current_token().child_token()` plus a bare
+//!    `tokio::task::spawn_local`) is cancelled with the request but is
+//!    neither waited for nor dropped, and is the host's
+//!    responsibility.  This holds when `run` is awaited to the end:
+//!    dropping the `run` future instead only schedules the tasks for
+//!    abort, and a task in a CPU loop blocks `run` until it yields,
+//!    which without [`Config::preempt_every`] it never does.
 //! 2. **One error type**, [`IsleError`], on this layer and on the
 //!    actors.  Lua errors are carried as their message today; a typed
 //!    payload shared by both layers is issue #11.
@@ -48,7 +54,34 @@
 //!
 //! Host functions called from Lua reach the running request or task
 //! through the context functions, which read a thread-local and so take
-//! no receiver: [`current_token`] and `cancellable`.
+//! no receiver: [`current_token`], `cancellable` and `current_scope`.
+//!
+//! # Host tasks
+//!
+//! A host function that starts work of its own takes the scope of the
+//! running request or task with `current_scope()` and spawns into it
+//! with `ScopeHandle::spawn_local`.  Such a task is structured like a
+//! Lua task: it is cancelled when the request or task ends or is
+//! cancelled, gets the grace (one deadline for the whole tree), is
+//! dropped when the grace ends, and is waited for.  Take the handle in
+//! the synchronous part of the host function (the `create_function`
+//! body, or a `create_async_function` body before its first `.await`)
+//! and move it into the future; `current_scope()` is `Some` only while
+//! a coroutine request or task is being polled, so it is `None` in a
+//! sync request.  `spawn_local` returns a `ScopedTask`; there are three
+//! ways to let go of it: await it (wait for the value), keep it for as
+//! long as the task should run (dropping it cancels the task now), or
+//! `detach()` it (fire and forget: the task runs on without a handle and
+//! is still cancelled, given the grace, dropped and waited for when the
+//! scope ends).
+//!
+//! ```text
+//! let bg = lua.create_function(|_, ()| {
+//!     let scope = current_scope().expect("inside a coroutine request");
+//!     scope.spawn_local(async move { /* host work */ }).detach();
+//!     Ok(())
+//! })?;
+//! ```
 
 use crate::error::IsleError;
 use crate::hooks::{self, CancelConfig};
@@ -61,7 +94,7 @@ use std::time::Duration;
 pub use crate::hook::{current_token, CancelToken};
 pub use crate::hooks::HookId;
 #[cfg(feature = "tokio")]
-pub use crate::scope::cancellable;
+pub use crate::scope::{cancellable, current_scope, ScopeHandle, ScopedTask};
 
 /// Settings of a VM.  One per VM, read and written through [`Vm`].
 ///
@@ -250,7 +283,8 @@ impl Vm {
     /// Run `f(args)` as a root coroutine under `token`.
     ///
     /// Resolves only after everything the root started has ended: the
-    /// Lua tasks it spawned, transitively (contract 1 of the
+    /// Lua tasks it spawned and the host tasks spawned through
+    /// [`current_scope`], transitively (contract 1 of the
     /// [module docs](self)).  Resolves to `Err(IsleError::Cancelled)` if
     /// `token` was cancelled; the coroutine and its tasks then get the
     /// VM's [`Config::grace`], as one deadline, before they are dropped.
