@@ -211,9 +211,12 @@ thread_local! {
 /// reaches that work too.  Returns `None` outside such a context.
 ///
 /// Work started this way (a `spawn_local` of its own) is cancelled with
-/// the request, but the request does not wait for it before it
-/// resolves.  To have the request wait, do the work inside the future of
-/// a [`create_async_function`](mlua::Lua::create_async_function), so the
+/// the request, but the request neither waits for it nor drops it.  To
+/// have the request wait for the work (and drop it when the grace ends),
+/// spawn it through the request's scope with
+/// `runtime::current_scope()` and `ScopeHandle::spawn_local` (`tokio`
+/// feature), or do it inside the future of a
+/// [`create_async_function`](mlua::Lua::create_async_function), so the
 /// coroutine awaits it.
 pub fn current_token() -> Option<CancelToken> {
     CURRENT.with(|c| c.borrow().clone())

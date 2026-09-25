@@ -17,6 +17,25 @@
   `hooks::CancelConfig`.
 - `AsyncIsleBuilder::config(Config)` sets the grace period and preemption
   without the init closure.  It replaces a config the init closure set.
+- Host tasks in a request's scope (#8): `runtime::current_scope()`
+  returns a `runtime::ScopeHandle` while a coroutine request or task is
+  polled (on the `AsyncIsle` path and on `Vm::run` / `run_root`; `None`
+  in a sync request), and `ScopeHandle::spawn_local(fut)` starts a host
+  future as a task of that scope.  The task gets a child token (its
+  `current_token()`, so `cancellable` works inside) and its own scope,
+  is cancelled when the request or task ends or is cancelled, shares the
+  grace deadline of the tree, is dropped when the grace ends, and is
+  waited for before the request resolves, like a `task.spawn` task.  It
+  returns a `runtime::ScopedTask<T>`, a future of `Result<T, IsleError>`
+  whose drop cancels the task without waiting; `ScopedTask::detach()`
+  lets the task run on without the handle (it stays in the scope and is
+  still cancelled, dropped and waited for when the scope ends), like
+  `AsyncTask::detach`.  `ScopeHandle::token()` is the scope's token.
+  `run`'s contract now covers these host tasks.  Tasks spawned into a
+  scope that is already ending share its remaining time: a scope whose
+  body ended normally takes its grace deadline when it starts waiting
+  for its tasks, and a spawn after that deadline starts nothing
+  (`Err(Cancelled)`).
 
 ### Changed
 - The cancel grace period is now one deadline shared by a request or
