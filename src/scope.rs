@@ -46,6 +46,28 @@ pub(crate) fn current_scope() -> Option<Rc<Scope>> {
     SCOPE.with(|s| s.borrow().clone())
 }
 
+/// RAII guard that makes `scope` the current scope of this thread.
+///
+/// The previous scope is restored on drop (also when the inner poll
+/// panics), so guards nest.
+struct ScopeEnterGuard {
+    prev: Option<Rc<Scope>>,
+}
+
+impl ScopeEnterGuard {
+    fn new(scope: &Rc<Scope>) -> Self {
+        let prev = SCOPE.with(|s| s.replace(Some(scope.clone())));
+        Self { prev }
+    }
+}
+
+impl Drop for ScopeEnterGuard {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        SCOPE.with(|s| *s.borrow_mut() = prev);
+    }
+}
+
 /// Tasks spawned from one coroutine request or task.
 #[derive(Default)]
 pub(crate) struct Scope {
@@ -164,10 +186,8 @@ impl<F: Future> Future for Scoped<F> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let _enter = EnterGuard::new(&self.token);
-        let prev = SCOPE.with(|s| s.replace(Some(self.scope.clone())));
-        let out = self.fut.as_mut().poll(cx);
-        SCOPE.with(|s| *s.borrow_mut() = prev);
-        out
+        let _scope = ScopeEnterGuard::new(&self.scope);
+        self.fut.as_mut().poll(cx)
     }
 }
 
