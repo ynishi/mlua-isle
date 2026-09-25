@@ -6,8 +6,9 @@
 //! installs a single **global** hook ([`mlua::Lua::set_global_hook`])
 //! whose callback, in order,
 //!
-//! 1. raises the cancellation error when the token of the request or
-//!    task currently executing is cancelled,
+//! 1. raises the cancellation error ([`Cancelled`](crate::Cancelled))
+//!    when the token of the request or task currently executing is
+//!    cancelled,
 //! 2. calls the callbacks registered with [`add_hook`], each at its own
 //!    [`HookTriggers`],
 //! 3. yields the running task every N instruction checks when
@@ -30,7 +31,7 @@
 //! a replacement through `set_global_hook` cannot be detected.
 
 use crate::error::IsleError;
-use crate::hook::{self, CANCELLED_SENTINEL};
+use crate::hook;
 use mlua::debug::{Debug, DebugEvent};
 use mlua::{HookTriggers, Lua, VmState};
 use std::cell::{Cell, RefCell};
@@ -189,7 +190,7 @@ fn dispatch(lua: &Lua, debug: &Debug, step: u32, cancel_every: u32) -> mlua::Res
         hub.checks.set(checks);
         if checks.is_multiple_of(cancel_every) {
             if hook::current_is_cancelled() {
-                return Err(mlua::Error::runtime(CANCELLED_SENTINEL));
+                return Err(crate::error::cancel_error());
             }
             if let Some(n) = hub.config.get().preempt_every {
                 if (checks / cancel_every).is_multiple_of(n.max(1)) && is_root(lua) {
@@ -252,6 +253,15 @@ fn is_root(lua: &Lua) -> bool {
 /// applies to the main thread and to coroutines created afterwards;
 /// coroutines that already exist keep the instruction count and events
 /// they were created with.
+///
+/// Known limit: a request's Lua error goes through the crate's message
+/// handler (a C function under `xpcall`).  Count and line callbacks do
+/// not fire inside it, but a callback with `on_calls` / `on_returns`
+/// fires for the handler's own call and return.  If that callback
+/// returns `Err`, its error replaces the original Lua error (the
+/// request fails with "error in error handling" or the callback's
+/// error).  Do not fail from call / return callbacks if the original
+/// error matters.
 pub fn add_hook<F>(lua: &Lua, triggers: HookTriggers, callback: F) -> Result<HookId, IsleError>
 where
     F: Fn(&Lua, &Debug) -> mlua::Result<VmState> + 'static,
@@ -306,8 +316,8 @@ mod tests {
     }
 
     fn assert_cancelled(r: mlua::Result<()>) {
-        let msg = r.unwrap_err().to_string();
-        assert!(msg.contains(CANCELLED_SENTINEL), "got: {msg}");
+        let e = r.unwrap_err();
+        assert!(crate::error::is_cancel(&e), "got: {e}");
     }
 
     #[test]

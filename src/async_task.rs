@@ -118,10 +118,8 @@ impl<T> Future for AsyncTask<T> {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
             // The oneshot sender was dropped without sending a result.
             // This happens when the Lua thread panics or shuts down while
-            // a request is in flight.  The string "oneshot closed" is used
-            // to distinguish this from std::sync::mpsc recv errors in the
-            // synchronous `Task`.
-            Poll::Ready(Err(_)) => Poll::Ready(Err(IsleError::RecvFailed("oneshot closed".into()))),
+            // a request is in flight.
+            Poll::Ready(Err(_)) => Poll::Ready(Err(IsleError::RecvFailed)),
             Poll::Pending => Poll::Pending,
         }
     }

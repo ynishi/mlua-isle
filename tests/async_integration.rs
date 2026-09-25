@@ -106,7 +106,7 @@ async fn async_spawn_eval_cancel() {
     let elapsed = start.elapsed();
 
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
     assert!(
         elapsed < Duration::from_secs(2),
         "cancel took too long: {elapsed:?}"
@@ -132,7 +132,7 @@ async fn async_spawn_call_cancel() {
     });
 
     let result = task.await;
-    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
     driver.shutdown().await.unwrap();
 }
 
@@ -154,7 +154,7 @@ async fn async_spawn_exec_cancel() {
     });
 
     let result = task.await;
-    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
     driver.shutdown().await.unwrap();
 }
 
@@ -211,8 +211,9 @@ async fn async_init_error_propagates() {
 
     assert!(result.is_err());
     match result.err().unwrap() {
-        IsleError::Init(msg) => {
-            assert!(!msg.is_empty());
+        IsleError::Init(f) => {
+            assert_eq!(f.kind, mlua_isle::LuaErrorKind::Syntax);
+            assert!(!f.message.is_empty());
         }
         other => panic!("expected Init error, got: {other}"),
     }
@@ -282,7 +283,7 @@ async fn async_channel_full_returns_correct_error() {
 
     // The last task should be ChannelFull (channel was full).
     let result = last_task.unwrap().await;
-    assert_eq!(result, Err(IsleError::ChannelFull));
+    assert!(matches!(result, Err(IsleError::ChannelFull)));
 
     blocker_token.cancel();
     let _ = blocker.await;
@@ -400,7 +401,7 @@ async fn builder_small_capacity_triggers_channel_full() {
     }
 
     let result = last_task.unwrap().await;
-    assert_eq!(result, Err(IsleError::ChannelFull));
+    assert!(matches!(result, Err(IsleError::ChannelFull)));
 
     blocker_token.cancel();
     let _ = blocker.await;
@@ -504,7 +505,7 @@ async fn coroutine_eval_cancel() {
     let start = Instant::now();
     let result = task.await;
 
-    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
     assert!(
         start.elapsed() < Duration::from_secs(2),
         "cancel took too long"
@@ -637,7 +638,7 @@ async fn assert_nested_loop_cancels(isle: &AsyncIsle, task: mlua_isle::AsyncTask
     let result = tokio::time::timeout(Duration::from_secs(2), task)
         .await
         .expect("cancel did not reach the nested coroutine");
-    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
 
     let probe = tokio::time::timeout(Duration::from_secs(2), isle.eval("return 1"))
         .await
@@ -711,7 +712,7 @@ async fn coroutine_cancel_drops_awaited_future_immediately() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let cancelled_at = Instant::now();
     task.cancel();
-    assert_eq!(task.await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(task.await.unwrap_err(), IsleError::Cancelled));
 
     // No collectgarbage() and no shutdown: the drop must already be done.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -749,7 +750,7 @@ async fn coroutine_cancel_closes_to_be_closed_variables() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     task.cancel();
-    assert_eq!(task.await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(task.await.unwrap_err(), IsleError::Cancelled));
 
     assert_eq!(isle.eval("return closed").await.unwrap(), "true");
     driver.shutdown().await.unwrap();

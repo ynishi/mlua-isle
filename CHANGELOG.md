@@ -2,7 +2,84 @@
 
 ## [Unreleased]
 
+### Breaking
+Typed errors (#11), per the API policy of #12: payloads change in place.
+
+- `IsleError::Lua(String)` → `IsleError::Lua(LuaFailure)`.  The payload
+  is built on the VM thread from the raised value: `kind`, `message`
+  (`tostring(err)`, honouring `__tostring`), `traceback`, and with the
+  `serde` feature `value`.  Migration: `IsleError::Lua(msg)` →
+  `IsleError::Lua(f)` and use `f.message` (or `f.to_string()`).  The
+  `Display` of `IsleError::Lua` is now `lua error: <message>`, without
+  mlua's `runtime error:` prefix and without the appended traceback
+  (that is in `f.traceback`).
+- `IsleError::Init(String)` → `IsleError::Init(LuaFailure)`, built from
+  the init closure's `mlua::Error`.  Migration: `Init(msg)` → `Init(f)`
+  and use `f.message`.  A pool with `max_size == 0` and a VM thread the
+  OS refuses to start are `Init` with `LuaErrorKind::External`.
+- `IsleError::ThreadPanic` → `IsleError::ThreadPanic(Option<String>)`,
+  the panic message when the payload is a `&str` / `String`.  Migration:
+  `ThreadPanic` → `ThreadPanic(_)`.  An init closure that panics is now
+  `ThreadPanic(Some(msg))` (was `Init("init channel closed: ...")`), from
+  `Isle::spawn` and `AsyncIsle::spawn`.
+- `IsleError::RecvFailed(String)` → `IsleError::RecvFailed` (the string
+  was a fixed discriminator).  Migration: `RecvFailed(_)` → `RecvFailed`.
+- New variant `IsleError::NotFound(String)`: `call` / `coroutine_call`
+  (and `spawn_*`) of a global that is not a function.  Was
+  `IsleError::Lua("function '<name>' not found: ...")`.  Migration: match
+  `NotFound(name)`.
+- `IsleError` no longer implements `PartialEq`.  Migration:
+  `assert_eq!(r, Err(IsleError::Cancelled))` →
+  `assert!(matches!(r, Err(IsleError::Cancelled)))`.
+- The cancellation error is `mlua::Error::external(Cancelled)` instead of
+  a runtime error carrying `__isle_cancelled__`; the sentinel string is
+  gone.  Rust detects a cancel by downcast, so a Lua error whose message
+  contains `__isle_cancelled__` is no longer reported as `Cancelled`.  In
+  Lua, `tostring` of the cancel error is `cancelled` plus a traceback.
+  Migration: Lua code that did `tostring(err):find("__isle_cancelled__")`
+  uses `task.is_cancelled(err)`; Rust code that matched the message uses
+  `e.downcast_ref::<Cancelled>()` (or `IsleError::from(e)`).
+- A sync request (`eval` / `call`) whose token was cancelled returns
+  `Cancelled` even when the Lua code caught the cancel and raised a
+  different error (as coroutine requests and `run_root` already did).
+- Sync `eval` / `call` run the Lua code under `xpcall` and `run_root`'s
+  root wrapper returns the error as a value instead of re-raising it, so
+  a raised table reaches Rust as its `tostring` and (with `serde`) its
+  value, not as mlua's flattened `RuntimeError`.  Errors while converting
+  a sync result to a string are `Lua(LuaFailure)` built from the
+  `mlua::Error` (the `UTF-8 error:` / `tostring failed:` prefixes are
+  gone).
+- Chunk names: a sync `eval` is compiled as chunk `eval` and a
+  `coroutine_eval` as `coroutine_eval`, so error positions read
+  `eval:1: ...` instead of a crate-internal source path.
+- The protected call captures `xpcall` when the VM is set up: the actors
+  do it before the init closure, `Vm::attach` on its first call.
+  Removing `xpcall` or replacing the globals afterwards no longer
+  affects requests.  `Vm::attach` on a VM that has no `xpcall` function
+  fails; attach before sandboxing the globals.
+- A memory error (`LUA_ERRMEM`) raised in a request is
+  `Lua(LuaFailure)` with `LuaErrorKind::Memory` and no traceback.
+
 ### Added
+- `LuaFailure` (`kind`, `message`, `traceback`, `value` with `serde`;
+  `LuaFailure::new`, `LuaFailure::from_mlua`, `From<mlua::Error>`,
+  `Display` = the message) and `LuaErrorKind` (`Runtime`, `Syntax`,
+  `Memory`, `Callback`, `External`, `Conversion`, `Other`).  A host
+  function that returns `Err(mlua::Error::external(e))` and is called
+  from Lua is `Callback`, with `e`'s `Display` as the message.
+  `LuaFailure` has no `source: mlua::Error`: without mlua's `error-send`
+  feature `mlua::Error` is not `Send`.
+- `Cancelled`, the error a cancel raises (`mlua::Error::external(Cancelled)`),
+  exported at the crate root and in `runtime`.  A host function may
+  return it to report a cancel.
+- `task.is_cancelled(err)` in the `task` library: true for the error a
+  cancel raises (caught with `pcall`, or received by a `__close`
+  handler) and for `task.CANCELLED`.  `join` still returns
+  `false, task.CANCELLED` for a cancelled task.
+- `serde` feature (`mlua/serialize` + `serde_json`): `LuaFailure::value`,
+  the raised value as `serde_json::Value` when it converts.
+- `runtime` re-exports `IsleError`, `LuaFailure`, `LuaErrorKind` and
+  `Cancelled`.
 - `runtime` module, the in-thread layer: `runtime::Vm` is the entry point
   for a host that owns the `Lua` and drives its own `LocalSet`.
   `Vm::attach(&lua, Config)` installs the hook and stores the config (a

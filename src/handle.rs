@@ -1,6 +1,6 @@
 //! Isle — the public handle for interacting with the Lua thread.
 
-use crate::error::IsleError;
+use crate::error::{panic_message, IsleError, LuaFailure};
 use crate::hook::CancelToken;
 use crate::task::Task;
 use crate::thread;
@@ -39,7 +39,9 @@ impl Isle {
     ///
     /// # Errors
     ///
-    /// Returns [`IsleError::Init`] if the init closure fails.
+    /// Returns [`IsleError::Init`] if the init closure fails (or the OS
+    /// refuses to start the thread), and [`IsleError::ThreadPanic`] with
+    /// the panic message if the init closure panics.
     pub fn spawn<F>(init: F) -> Result<Self, IsleError>
     where
         F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
@@ -51,8 +53,12 @@ impl Isle {
             .name("mlua-isle".into())
             .spawn(move || {
                 let lua = mlua::Lua::new();
-                match init(&lua)
-                    .map_err(|e| IsleError::Init(e.to_string()))
+                // Before `init`: captures `xpcall` while the globals are
+                // intact (see `protect`).
+                match crate::protect::install(&lua)
+                    .and_then(|()| {
+                        init(&lua).map_err(|e| IsleError::Init(LuaFailure::from_mlua(&e)))
+                    })
                     .and_then(|()| crate::runtime::attach_after_init(&lua, None).map(drop))
                 {
                     Ok(()) => {
@@ -64,12 +70,19 @@ impl Isle {
                     }
                 }
             })
-            .map_err(|e| IsleError::Init(format!("thread spawn failed: {e}")))?;
+            .map_err(|e| IsleError::Init(LuaFailure::from_mlua(&mlua::Error::external(e))))?;
 
-        // Wait for init to complete
-        init_rx
-            .recv()
-            .map_err(|e| IsleError::Init(format!("init channel closed: {e}")))??;
+        // Wait for init to complete.  A closed channel means the thread
+        // ended without reporting: the init closure panicked.
+        match init_rx.recv() {
+            Ok(result) => result?,
+            Err(_) => {
+                let payload = join.join().err();
+                return Err(IsleError::ThreadPanic(
+                    payload.as_deref().and_then(panic_message),
+                ));
+            }
+        }
 
         Ok(Self {
             tx,
@@ -81,6 +94,12 @@ impl Isle {
     ///
     /// Returns the result as a string.  Equivalent to
     /// `spawn_eval(code).wait()`.
+    ///
+    /// A Lua error is [`IsleError::Lua`].  When the request's token was
+    /// cancelled, the result is [`IsleError::Cancelled`] even if the Lua
+    /// code caught the cancel and raised an error of its own (the same
+    /// rule as coroutine requests and `Vm::run`); this holds for `call`
+    /// too.
     pub fn eval(&self, code: &str) -> Result<String, IsleError> {
         self.spawn_eval(code).wait()
     }
@@ -176,11 +195,23 @@ impl Isle {
     ///
     /// After shutdown, all subsequent requests will return
     /// [`IsleError::Shutdown`].
+    ///
+    /// # Errors
+    ///
+    /// [`IsleError::ThreadPanic`] if the Lua thread panicked (a request
+    /// whose Rust code panicked ends the thread; that request itself
+    /// returns [`IsleError::RecvFailed`]), with the panic message when
+    /// the payload is a `&str` or a `String`.
     pub fn shutdown(self) -> Result<(), IsleError> {
         let _ = self.tx.send(Request::Shutdown);
-        let handle = self.join.lock().map_err(|_| IsleError::ThreadPanic)?.take();
+        let handle = self
+            .join
+            .lock()
+            .map_err(|_| IsleError::ThreadPanic(None))?
+            .take();
         if let Some(join) = handle {
-            join.join().map_err(|_| IsleError::ThreadPanic)?;
+            join.join()
+                .map_err(|p| IsleError::ThreadPanic(panic_message(p.as_ref())))?;
         }
         Ok(())
     }

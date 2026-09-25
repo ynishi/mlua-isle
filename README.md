@@ -31,6 +31,9 @@ communicating via channels.
   `try_checkout` / `checkout_timeout` are async, idle wait uses
   `tokio::sync::Notify`, and each slot owns both an `AsyncIsle` handle
   and its `AsyncIsleDriver` so VMs can be joined on shutdown
+- **Typed errors** — one error type, `IsleError`; a Lua error arrives as
+  `IsleError::Lua(LuaFailure)` with its kind, message, traceback and
+  (`serde` feature) the raised value, and a cancel is recognised by value
 - **Zero unsafe in user code** — both `Isle` and `AsyncIsle` are safe to
   share across threads
 
@@ -85,6 +88,9 @@ mlua-isle = "0.7"
 
 # Both:
 # mlua-isle = { version = "0.7", features = ["tokio", "pool"] }
+
+# The value a Lua error raised, as JSON, on `LuaFailure::value`:
+# mlua-isle = { version = "0.7", features = ["serde"] }
 ```
 
 ### Sync API
@@ -286,6 +292,52 @@ The isle owns the VM's Lua debug hook.  Register your own hook callbacks
 with `hooks::add_hook` rather than `Lua::set_hook`, which would replace
 the cancel hook.
 
+### Errors
+
+Every function returns `IsleError`.  A Lua error of a request or root is
+`IsleError::Lua(LuaFailure)`, built on the VM thread from the raised
+value, the same on every path (`Isle`, `AsyncIsle` sync and coroutine
+requests, `Vm::run` / `run_root`):
+
+```rust
+use mlua_isle::{Isle, IsleError, LuaErrorKind};
+
+let isle = Isle::spawn(|_| Ok(())).unwrap();
+match isle.eval("error({ code = 42 })") {
+    Err(IsleError::Lua(f)) => {
+        assert_eq!(f.kind, LuaErrorKind::Runtime);
+        println!("{}", f.message);          // tostring(err), honours __tostring
+        println!("{:?}", f.traceback);      // where it was raised
+        // With the `serde` feature: f.value == Some(json!({ "code": 42 }))
+    }
+    Err(IsleError::Cancelled) => { /* the token was cancelled */ }
+    Err(other) => panic!("{other}"),
+    Ok(v) => println!("{v}"),
+}
+```
+
+Other variants: `Init(LuaFailure)` (the init closure failed),
+`NotFound(name)` (`call` of a global that is not a function),
+`ThreadPanic(Option<String>)` (with the panic message), `RecvFailed`,
+`Shutdown`, `ChannelFull`, and the pool errors.  `IsleError` does not
+implement `PartialEq`; match with `matches!`.
+
+A cancel reaches Lua code as an error value (the cancel hook raises it
+in a CPU loop, `cancellable` at an await point).  Rust recognises it by
+value (`mlua::Error::external(Cancelled)`, found with
+`downcast_ref::<Cancelled>()`), never by message.  Lua code tells it
+from other errors with `task.is_cancelled(err)` from the `task` library,
+which is also true for `task.CANCELLED` (what `join` returns for a
+cancelled task):
+
+```lua
+local ok, err = pcall(sleep, 1000)
+if not ok and task.is_cancelled(err) then
+  cleanup()
+  error(err, 0)  -- let the cancel continue
+end
+```
+
 ### Running Lua on a VM you own
 
 The actors are built on `runtime::Vm`, the in-thread layer.  A host that
@@ -401,7 +453,7 @@ returning.
 | `task.cancel()` | Cancel the running task |
 | `task.cancel_token()` | Access the `CancelToken` for sharing |
 | `task.detach()` | Let the task run without the handle (dropping it cancels) |
-| `tasks::install(lua)` | Lua `task` library: `spawn` / `join` / `cancel` / `done` |
+| `tasks::install(lua)` | Lua `task` library: `spawn` / `join` / `cancel` / `done` / `is_cancelled` |
 | `hooks::configure(lua, config)` | Cancel grace period and preemption |
 | `hooks::add_hook(lua, triggers, f)` | Register a Lua hook callback next to the cancel hook |
 | `cancellable(fut)` | Make an async host function stop at cancel |

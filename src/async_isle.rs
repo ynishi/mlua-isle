@@ -137,7 +137,7 @@
 //! ```
 
 use crate::async_task::AsyncTask;
-use crate::error::IsleError;
+use crate::error::{panic_message, IsleError, LuaErrorKind, LuaFailure};
 use crate::hook::CancelToken;
 use crate::runtime::Config;
 use crate::thread;
@@ -399,7 +399,10 @@ impl AsyncIsle {
     ///
     /// # Errors
     ///
-    /// Returns [`IsleError::Init`] if the init closure fails.
+    /// Returns [`IsleError::Init`] if the init closure fails (or the
+    /// thread or its runtime cannot be set up), and
+    /// [`IsleError::ThreadPanic`] with the panic message if the init
+    /// closure panics.
     pub async fn spawn<F>(init: F) -> Result<(Self, AsyncIsleDriver), IsleError>
     where
         F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
@@ -439,8 +442,9 @@ impl AsyncIsle {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        let _ = init_tx.send(Err(IsleError::Init(format!(
-                            "tokio runtime build failed: {e}"
+                        let _ = init_tx.send(Err(IsleError::Init(LuaFailure::new(
+                            LuaErrorKind::External,
+                            format!("tokio runtime build failed: {e}"),
                         ))));
                         let _ = done_tx.send(());
                         return;
@@ -448,8 +452,12 @@ impl AsyncIsle {
                 };
 
                 let lua = mlua::Lua::new();
-                match init(&lua)
-                    .map_err(|e| IsleError::Init(e.to_string()))
+                // Before `init`: captures `xpcall` while the globals are
+                // intact (see `protect`).
+                match crate::protect::install(&lua)
+                    .and_then(|()| {
+                        init(&lua).map_err(|e| IsleError::Init(LuaFailure::from_mlua(&e)))
+                    })
                     .and_then(|()| crate::runtime::attach_after_init(&lua, config).map(drop))
                 {
                     Ok(()) => {
@@ -465,11 +473,23 @@ impl AsyncIsle {
                 // `shutdown().await` never hangs.
                 let _ = done_tx.send(());
             })
-            .map_err(|e| IsleError::Init(format!("thread spawn failed: {e}")))?;
+            .map_err(|e| IsleError::Init(LuaFailure::from_mlua(&mlua::Error::external(e))))?;
 
-        init_rx
-            .await
-            .map_err(|e| IsleError::Init(format!("init channel closed: {e}")))??;
+        // A closed channel means the thread ended without reporting: the
+        // init closure panicked.  `done_tx` is dropped by the same
+        // unwind, so after it the join returns at once.
+        let init_result = init_rx.await;
+        let init_result = match init_result {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = done_rx.await;
+                let payload = join.join().err();
+                return Err(IsleError::ThreadPanic(
+                    payload.as_deref().and_then(panic_message),
+                ));
+            }
+        };
+        init_result?;
 
         let handle = Self { tx: tx.clone() };
         let driver = AsyncIsleDriver {
@@ -490,6 +510,11 @@ impl AsyncIsle {
     ///
     /// For cooperative execution that interleaves with other
     /// coroutines, use [`coroutine_eval`](Self::coroutine_eval).
+    ///
+    /// When the request's token was cancelled, the result is
+    /// [`IsleError::Cancelled`] even if the Lua code caught the cancel
+    /// and raised an error of its own (the same rule as coroutine
+    /// requests); this holds for `call` too.
     ///
     /// Equivalent to `spawn_eval(code).await`.
     pub async fn eval(&self, code: &str) -> Result<String, IsleError> {
@@ -686,24 +711,45 @@ impl AsyncIsleDriver {
     ///
     /// # Errors
     ///
-    /// Returns [`IsleError::ThreadPanic`] if the Lua thread panicked
-    /// or the join operation fails.
+    /// Returns [`IsleError::ThreadPanic`] if the Lua thread panicked,
+    /// with the panic message when the payload is a `&str` or a
+    /// `String`.
+    ///
+    /// A panic inside a request does not end the thread, so it is not
+    /// reported here; the thread's `LocalSet` catches it:
+    ///
+    /// - In a sync request (`eval` / `call` / `exec` and their `spawn_*`
+    ///   forms), the panic ends the task that receives requests: that
+    ///   request returns [`IsleError::RecvFailed`], the isle stops
+    ///   serving (later requests return [`IsleError::Shutdown`]), and
+    ///   `shutdown` returns `Ok(())` once the coroutine requests still
+    ///   running have finished.  The panic message is lost.
+    /// - In a coroutine request, the panic ends that request only (it
+    ///   returns [`IsleError::RecvFailed`]); the isle keeps serving.
     pub async fn shutdown(mut self) -> Result<(), IsleError> {
         // Use .send().await to respect backpressure instead of try_send,
         // which would silently drop the shutdown signal when the channel is full.
         let _ = self.tx.send(AsyncRequest::Shutdown).await;
 
-        // Await the Lua thread's completion signal (pure async).
+        // Await the Lua thread's completion signal (pure async).  An
+        // error means the thread dropped the sender without sending: it
+        // panicked, and the join below returns the payload.
+        let mut done = true;
         if let Some(done_rx) = self.done_rx.take() {
-            done_rx.await.map_err(|_| IsleError::ThreadPanic)?;
+            done = done_rx.await.is_ok();
         }
 
         // The thread has already exited — join() returns immediately.
         if let Some(join) = self.join.take() {
-            join.join().map_err(|_| IsleError::ThreadPanic)?;
+            join.join()
+                .map_err(|p| IsleError::ThreadPanic(panic_message(p.as_ref())))?;
         }
 
-        Ok(())
+        if done {
+            Ok(())
+        } else {
+            Err(IsleError::ThreadPanic(None))
+        }
     }
 
     /// Check if the Lua thread is still alive.
@@ -867,7 +913,11 @@ async fn execute_coroutine_eval(
     code: &str,
     cancel: &CancelToken,
 ) -> Result<String, IsleError> {
-    let func = lua.load(code).into_function().map_err(IsleError::from)?;
+    let func = lua
+        .load(code)
+        .set_name("=coroutine_eval")
+        .into_function()
+        .map_err(IsleError::from)?;
     let values = vm(lua)?.run(cancel, func, ()).await?;
     thread::lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
 }
@@ -881,18 +931,8 @@ async fn execute_coroutine_call(
     args: &[String],
     cancel: &CancelToken,
 ) -> Result<String, IsleError> {
-    let func: mlua::Function = lua
-        .globals()
-        .get(func_name)
-        .map_err(|e| IsleError::Lua(format!("function '{func_name}' not found: {e}")))?;
-
-    let lua_args: Vec<mlua::Value> = args
-        .iter()
-        .map(|s| lua.create_string(s).map(mlua::Value::String))
-        .collect::<mlua::Result<Vec<_>>>()
-        .map_err(IsleError::from)?;
-
-    let multi = mlua::MultiValue::from_vec(lua_args);
+    let func = thread::global_function(lua, func_name)?;
+    let multi = thread::string_args(lua, args)?;
     let values = vm(lua)?.run(cancel, func, multi).await?;
     thread::lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
 }

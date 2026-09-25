@@ -168,7 +168,7 @@ mod with_tokio {
                 .await
                 .expect("timed out")
         });
-        assert_eq!(out.unwrap_err(), IsleError::Cancelled);
+        assert!(matches!(out.unwrap_err(), IsleError::Cancelled));
     }
 
     /// Isle with `hold(ms)` (not cancellable) and `sleep(ms)`
@@ -214,7 +214,7 @@ mod with_tokio {
         let r = tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .expect("timed out");
-        assert_eq!(r.unwrap_err(), IsleError::Cancelled);
+        assert!(matches!(r.unwrap_err(), IsleError::Cancelled));
         isle.eval("return cleaned").await.unwrap() == "true"
     }
 

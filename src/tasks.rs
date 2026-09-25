@@ -10,6 +10,8 @@
 //! | `h:cancel()` | Request cancellation.  Does not wait. |
 //! | `h:done()` | Whether the task has finished. |
 //! | `local h <close> = task.spawn(...)` | On scope exit, a task that was not joined is cancelled and waited for. |
+//! | `task.is_cancelled(err)` | Whether `err` is a cancellation: the error a cancel raises (caught with `pcall`, or received by a `__close` handler) or `task.CANCELLED`.  `false` for any other value. |
+//! | `task.CANCELLED` | What `join` returns as `err` for a cancelled task. |
 //!
 //! Tasks are **structured**: when a coroutine request or task finishes,
 //! the tasks it spawned and did not join are cancelled, and it waits
@@ -28,6 +30,29 @@
 //! (including host tasks), and inside [`run_root`](crate::run_root) /
 //! [`Vm::run`](crate::runtime::Vm::run).  Sync requests (`eval` /
 //! `call` / `exec`) cannot await, so `task.spawn` raises an error there.
+//!
+//! # Telling a cancel from an error
+//!
+//! A cancel reaches Lua code as an error: the cancel hook raises it
+//! while Lua code runs, and an async host function wrapped with
+//! [`cancellable`](crate::cancellable) returns it while the coroutine
+//! awaits.  Its value is `mlua::Error::external(`[`Cancelled`](crate::Cancelled)`)`
+//! (a userdata to Lua); `task.is_cancelled(err)` is the test, and it is
+//! also true for `task.CANCELLED`, so one predicate covers both:
+//!
+//! ```lua
+//! local ok, err = pcall(sleep, 1000)
+//! if not ok and task.is_cancelled(err) then
+//!   -- cancelled: clean up and let the cancel continue
+//!   error(err, 0)
+//! end
+//! ```
+//!
+//! The predicate lives in this library: a VM that runs without the
+//! `task` table (a host that uses [`Vm::attach`](crate::runtime::Vm::attach)
+//! but never sets [`Vm::task_lib`](crate::runtime::Vm::task_lib)) has no
+//! `task.is_cancelled`; Rust code tests an `mlua::Error` with
+//! `e.downcast_ref::<Cancelled>()`.
 //!
 //! A task that runs a CPU loop never yields on its own, so a sibling on
 //! the same thread cannot run to cancel it; enable
@@ -60,14 +85,15 @@
 //! [`AsyncIsleDriver::shutdown`](crate::AsyncIsleDriver::shutdown) from
 //! returning).
 
-use crate::scope::{self, Spawned, WRAP_PCALL};
+use crate::scope::{self, Spawned, Wrap};
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 const LIB: &str = r#"
-local spawn_raw, join_raw, cancel_raw, done_raw, release_raw, CANCELLED = ...
+local spawn_raw, join_raw, cancel_raw, done_raw, release_raw, is_cancel_error, CANCELLED = ...
+local rawequal = rawequal
 
 local Task = {}
 Task.__index = Task
@@ -98,6 +124,10 @@ Task.__gc = function(self)
 end
 
 local task = { CANCELLED = CANCELLED }
+
+function task.is_cancelled(err)
+  return rawequal(err, CANCELLED) or is_cancel_error(err)
+end
 
 function task.spawn(f, ...)
   return setmetatable({ _id = spawn_raw(f, ...) }, Task)
@@ -162,7 +192,7 @@ pub fn install(lua: &Lua) -> mlua::Result<Table> {
             )
         })?;
         let grace = crate::hooks::config(lua).grace;
-        let (root, body) = scope::lua_body(lua, WRAP_PCALL, f, MultiValue::from_iter(args))?;
+        let (root, body) = scope::lua_body(lua, Wrap::PCall, f, MultiValue::from_iter(args))?;
         // `None` in the result slot means cancelled.
         let task = scope.spawn(grace, Some(root), body, |out, token| match out {
             None => None,
@@ -224,12 +254,19 @@ pub fn install(lua: &Lua) -> mlua::Result<Table> {
         Ok(())
     })?;
 
+    // True for the error a cancel raises: mlua hands a Rust error
+    // (`WrappedFailure` userdata) to Rust as `Value::Error`.
+    let is_cancel_error = lua.create_function(|_, v: Value| {
+        Ok(matches!(&v, Value::Error(e) if crate::error::is_cancel(e)))
+    })?;
+
     lua.load(LIB).set_name("=mlua_isle.tasks").call((
         spawn_raw,
         join_raw,
         cancel_raw,
         done_raw,
         release_raw,
+        is_cancel_error,
         cancelled_marker,
     ))
 }

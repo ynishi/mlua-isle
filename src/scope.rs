@@ -13,7 +13,7 @@
 //! differ only in the body.
 
 use crate::error::IsleError;
-use crate::hook::{CancelToken, EnterGuard, CANCELLED_SENTINEL};
+use crate::hook::{CancelToken, EnterGuard};
 use crate::hooks;
 use mlua::{Function, Lua, MultiValue, Value};
 use std::cell::{Cell, RefCell};
@@ -24,20 +24,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// Wraps a request body: marks the isle-created coroutine, then calls.
-///
-/// The call goes through `pcall` and the error is re-raised: an error
-/// that escapes a coroutine leaves its to-be-closed variables open until
-/// the coroutine is closed from C, where `__close` cannot yield, while
-/// `pcall` closes them during the unwind, where it can.
-pub(crate) const WRAP_CALL: &str = "local mark, f = ... \
-     local pack, unpack = table.pack, table.unpack \
-     return function(...) \
-       mark() \
-       local r = pack(pcall(f, ...)) \
-       if r[1] then return unpack(r, 2, r.n) end \
-       error(r[2], 0) \
-     end";
+/// How a Lua body is wrapped by [`lua_body`].
+pub(crate) enum Wrap {
+    /// A root: [`WRAP_CALL`](crate::protect::WRAP_CALL), `xpcall` with
+    /// the traceback handler (the VM's protect parts); the error comes
+    /// back as values.
+    Call(crate::protect::Parts),
+    /// A task: [`WRAP_PCALL`]; `false, err` is the task's result.
+    PCall,
+}
+
 /// Wraps a task body: marks the coroutine, then calls under `pcall` so
 /// that the raw Lua error value survives (a table stays a table).
 pub(crate) const WRAP_PCALL: &str =
@@ -370,13 +366,13 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Build the coroutine body of a Lua call: `func` wrapped with `wrap`
-/// ([`WRAP_CALL`] or [`WRAP_PCALL`]), which marks the coroutine as
-/// isle-created.  Returns the mark (to forget when the body is dropped)
-/// and the not yet polled call.
+/// Build the coroutine body of a Lua call: `func` wrapped per `wrap`
+/// (see [`Wrap`]), which marks the coroutine as isle-created.  Returns
+/// the mark (to forget when the body is dropped) and the not yet polled
+/// call.
 pub(crate) fn lua_body(
     lua: &Lua,
-    wrap: &str,
+    wrap: Wrap,
     func: Function,
     args: MultiValue,
 ) -> mlua::Result<(RootMark, impl Future<Output = mlua::Result<MultiValue>>)> {
@@ -388,7 +384,13 @@ pub(crate) fn lua_body(
         r.set(Some(ptr));
         Ok(())
     })?;
-    let body: Function = lua.load(wrap).call((mark, func))?;
+    let body: Function = match wrap {
+        Wrap::Call((xpcall, handler, take)) => lua
+            .load(crate::protect::WRAP_CALL)
+            .set_name("=mlua_isle.root")
+            .call((mark, func, xpcall, handler, take))?,
+        Wrap::PCall => lua.load(WRAP_PCALL).call((mark, func))?,
+    };
     Ok((root, body.call_async::<MultiValue>(args)))
 }
 
@@ -481,7 +483,9 @@ async fn with_grace<F: Future>(scope: &Scope, fut: F) -> Option<F::Output> {
 /// [`create_async_function`](mlua::Lua::create_async_function) with it:
 /// when the token of the request or task that called the function is
 /// cancelled while the future is pending, the future is dropped and the
-/// call returns the cancellation error to the Lua code.  That error
+/// call returns the cancellation error
+/// (`mlua::Error::external(`[`Cancelled`](crate::Cancelled)`)`) to the
+/// Lua code, where `task.is_cancelled(err)` recognises it.  That error
 /// unwinds the coroutine normally, so its `__close` handlers run and can
 /// await (see [`CancelConfig::grace`](crate::hooks::CancelConfig::grace)).
 ///
@@ -516,7 +520,7 @@ where
         None => fut.await,
         Some(token) => tokio::select! {
             biased;
-            _ = token.cancelled() => Err(mlua::Error::runtime(CANCELLED_SENTINEL)),
+            _ = token.cancelled() => Err(crate::error::cancel_error()),
             out = fut => out,
         },
     }
@@ -531,7 +535,14 @@ where
 /// once, then await this inside a [`tokio::task::LocalSet`].
 ///
 /// Resolves to `Err(IsleError::Cancelled)` if `token` was cancelled,
-/// whatever the coroutine returned.
+/// whatever the coroutine returned.  A Lua error resolves to
+/// `Err(IsleError::Lua(f))`, where the [`LuaFailure`](crate::LuaFailure)
+/// is built from the raised value itself on this thread: `f.message` is
+/// `tostring(err)` and, with the `serde` feature, `f.value` is the value
+/// as JSON (so `error({ code = 42 })` gives `f.value["code"] == 42`).
+/// The cancellation error raised by some other token (a host function
+/// that returned `Err(mlua::Error::external(Cancelled))`) also resolves
+/// to `Err(IsleError::Cancelled)`.
 ///
 /// On cancel, the coroutine gets the grace period and is then dropped,
 /// and this resolves only after the tasks it spawned, transitively,
@@ -562,14 +573,16 @@ pub async fn run_root(
 ) -> Result<MultiValue, crate::IsleError> {
     hooks::ensure_installed(lua)?;
     let grace = hooks::config(lua).grace;
-    let (root, body) = lua_body(lua, WRAP_CALL, func, args)?;
+    let parts = crate::protect::parts(lua)?;
+    let (root, body) = lua_body(lua, Wrap::Call(parts), func, args)?;
     let scope = Rc::new(Scope::new(token.clone(), grace, None));
     let out = run_in(scope, Some(root), body).await;
     if token.is_cancelled() {
         return Err(crate::IsleError::Cancelled);
     }
     match out {
-        Some(r) => r.map_err(crate::IsleError::from),
+        Some(Ok(values)) => crate::protect::unwrap_root(lua, values),
+        Some(Err(e)) => Err(crate::IsleError::from(e)),
         None => Err(crate::IsleError::Cancelled),
     }
 }

@@ -212,7 +212,10 @@ async fn cancelling_the_request_reaches_grandchildren() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let cancelled_at = Instant::now();
     task.cancel();
-    assert_eq!(within(1000, task).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(1000, task).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     let resolved_at = Instant::now();
 
     // The drops happen on the isle thread before the result is sent, so
@@ -334,7 +337,10 @@ async fn preemption_interleaves_cpu_bound_requests() {
         .unwrap();
     assert_eq!(r, "still responsive");
     spin.cancel();
-    assert_eq!(within(1000, spin).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(1000, spin).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     driver.shutdown().await.unwrap();
 }
 
@@ -357,7 +363,10 @@ async fn grace_lets_close_handlers_await() {
     );
     tokio::time::sleep(Duration::from_millis(30)).await;
     task.cancel();
-    assert_eq!(within(1000, task).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(1000, task).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     assert_eq!(isle.eval("return cleaned").await.unwrap(), "true");
     driver.shutdown().await.unwrap();
 }
@@ -375,7 +384,10 @@ async fn without_grace_an_awaiting_close_handler_cannot_finish() {
     );
     tokio::time::sleep(Duration::from_millis(30)).await;
     task.cancel();
-    assert_eq!(within(1000, task).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(1000, task).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(isle.eval("return cleaned").await.unwrap(), "false");
     driver.shutdown().await.unwrap();
@@ -394,7 +406,10 @@ async fn grace_ends_with_a_hard_drop() {
     tokio::time::sleep(Duration::from_millis(30)).await;
     let cancelled_at = Instant::now();
     task.cancel();
-    assert_eq!(within(1000, task).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(1000, task).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     let (_, at) = drops.lock().unwrap()[0];
     let waited = at.duration_since(cancelled_at);
     assert!(
@@ -460,7 +475,10 @@ async fn user_hooks_coexist_with_cancellation() {
     let task = isle.spawn_eval("coroutine.wrap(function() while true do end end)()");
     tokio::time::sleep(Duration::from_millis(30)).await;
     task.cancel();
-    assert_eq!(within(1000, task).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(1000, task).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     driver.shutdown().await.unwrap();
 }
 
@@ -480,7 +498,10 @@ async fn a_hook_replaced_with_set_hook_is_restored_at_the_next_request() {
     let task = isle.spawn_eval("coroutine.wrap(function() while true do end end)()");
     tokio::time::sleep(Duration::from_millis(30)).await;
     task.cancel();
-    assert_eq!(within(1000, task).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(1000, task).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     driver.shutdown().await.unwrap();
 }
 
@@ -688,7 +709,7 @@ const CHILD: &str = "local c = task.spawn(function() return hsleep() end)
 /// The `hsleep` future was dropped once, before `run_root` resolved;
 /// returns how long after the cancel.
 fn assert_dropped_before_resolve(r: &CancelledRoot) -> Duration {
-    assert_eq!(r.out.as_ref().unwrap_err(), &IsleError::Cancelled);
+    assert!(matches!(r.out.as_ref().unwrap_err(), &IsleError::Cancelled));
     let drops: Vec<_> = r.log.iter().filter(|(n, _)| *n == "drop").collect();
     assert_eq!(drops.len(), 1, "log: {:?}", r.log);
     let drop_at = drops[0].1;

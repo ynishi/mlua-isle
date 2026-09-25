@@ -3,16 +3,14 @@
 //! A [`CancelToken`] is a shared `AtomicBool` that can be checked from
 //! both Rust code and a Lua debug hook.  When the token of the request
 //! (or task) currently executing is cancelled, the cancel hook (see
-//! [`hooks`](crate::hooks)) raises a Lua error containing the sentinel
-//! `__isle_cancelled__`, which is recognized by
-//! [`IsleError::from(mlua::Error)`](crate::IsleError).
+//! [`hooks`](crate::hooks)) raises `mlua::Error::external(Cancelled)`
+//! (see [`Cancelled`](crate::Cancelled)), which
+//! [`IsleError::from(mlua::Error)`](crate::IsleError) recognises by
+//! downcast.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-
-/// Sentinel message carried by the Lua error that cancellation raises.
-pub(crate) const CANCELLED_SENTINEL: &str = "__isle_cancelled__";
 
 /// Cancellation signal shared between caller and Lua thread.
 ///
