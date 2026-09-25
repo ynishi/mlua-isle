@@ -14,7 +14,7 @@
 
 use crate::error::IsleError;
 use crate::hook::{CancelToken, EnterGuard};
-use crate::hooks;
+use crate::hub;
 use mlua::{Function, Lua, MultiValue, Value};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -343,7 +343,7 @@ impl<F: Future> Future for Scoped<F> {
 impl<F> Drop for Scoped<F> {
     fn drop(&mut self) {
         if let Some(ptr) = self.root.as_ref().and_then(|r| r.take()) {
-            hooks::unmark_root(ptr);
+            hub::unmark_root(ptr);
         }
     }
 }
@@ -380,7 +380,7 @@ pub(crate) fn lua_body(
     let r = root.clone();
     let mark = lua.create_function(move |lua, ()| {
         let ptr = lua.current_thread().to_pointer() as usize;
-        hooks::mark_root(ptr);
+        hub::mark_root(ptr);
         r.set(Some(ptr));
         Ok(())
     })?;
@@ -487,14 +487,15 @@ async fn with_grace<F: Future>(scope: &Scope, fut: F) -> Option<F::Output> {
 /// (`mlua::Error::external(`[`Cancelled`](crate::Cancelled)`)`) to the
 /// Lua code, where `task.is_cancelled(err)` recognises it.  That error
 /// unwinds the coroutine normally, so its `__close` handlers run and can
-/// await (see [`CancelConfig::grace`](crate::hooks::CancelConfig::grace)).
+/// await (see [`Config::grace`](crate::runtime::Config::grace)).
 ///
 /// Outside a request or task the future runs unchanged.
 ///
 /// ```rust
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// use mlua_isle::{cancellable, AsyncIsle};
+/// use mlua_isle::runtime::cancellable;
+/// use mlua_isle::AsyncIsle;
 /// use std::time::Duration;
 ///
 /// let (isle, driver) = AsyncIsle::spawn(|lua| {
@@ -527,52 +528,16 @@ where
 }
 
 /// Run `func(args)` as a root coroutine: in its own scope under `token`,
-/// with the VM's cancel grace (see [`hooks::configure`]).
-///
-/// This is what a coroutine request of an [`AsyncIsle`](crate::AsyncIsle)
-/// does.  Use it to run Lua with task support on a VM you drive
-/// yourself: call [`hooks::install`] and [`tasks::install`](crate::tasks::install)
-/// once, then await this inside a [`tokio::task::LocalSet`].
-///
-/// Resolves to `Err(IsleError::Cancelled)` if `token` was cancelled,
-/// whatever the coroutine returned.  A Lua error resolves to
-/// `Err(IsleError::Lua(f))`, where the [`LuaFailure`](crate::LuaFailure)
-/// is built from the raised value itself on this thread: `f.message` is
-/// `tostring(err)` and, with the `serde` feature, `f.value` is the value
-/// as JSON (so `error({ code = 42 })` gives `f.value["code"] == 42`).
-/// The cancellation error raised by some other token (a host function
-/// that returned `Err(mlua::Error::external(Cancelled))`) also resolves
-/// to `Err(IsleError::Cancelled)`.
-///
-/// On cancel, the coroutine gets the grace period and is then dropped,
-/// and this resolves only after the tasks it spawned, transitively,
-/// have finished or been dropped: Lua tasks and host tasks spawned
-/// through [`current_scope`].  The grace period is one deadline for
-/// the coroutine and all of those tasks: a task started during cleanup
-/// gets the time that remains, not a grace period of its own.
-/// So nothing the cancelled call started is still alive when the next
-/// call on the VM begins.  A task in a CPU loop cannot be dropped until
-/// it yields; without
-/// [`CancelConfig::preempt_every`](crate::hooks::CancelConfig::preempt_every)
-/// the wait blocks on it.
-///
-/// # Dropping the future
-///
-/// Dropping the returned future before it resolves (wrapping it in
-/// [`tokio::time::timeout`], or a losing [`tokio::select!`] arm) drops
-/// the coroutine at once but only schedules the tasks it spawned for
-/// abort: tokio drops them on a later poll of the `LocalSet`, as with
-/// [`AbortHandle::abort`](tokio::task::AbortHandle::abort).  To have the
-/// tasks gone before you continue, [cancel](CancelToken::cancel) the
-/// token and await the future instead of dropping it.
-pub async fn run_root(
+/// with the VM's grace.  The body of
+/// [`Vm::run`](crate::runtime::Vm::run), which documents it.
+pub(crate) async fn run_root(
     lua: &Lua,
     token: CancelToken,
     func: Function,
     args: MultiValue,
 ) -> Result<MultiValue, crate::IsleError> {
-    hooks::ensure_installed(lua)?;
-    let grace = hooks::config(lua).grace;
+    hub::ensure_installed(lua)?;
+    let grace = hub::config(lua).grace;
     let parts = crate::protect::parts(lua)?;
     let (root, body) = lua_body(lua, Wrap::Call(parts), func, args)?;
     let scope = Rc::new(Scope::new(token.clone(), grace, None));
@@ -602,7 +567,7 @@ pub(crate) fn error_value(e: mlua::Error) -> Value {
 /// and inside a host task started with [`ScopeHandle::spawn_local`]
 /// (there it is that task's own scope).  This holds on both the
 /// [`AsyncIsle`](crate::AsyncIsle) path and the
-/// [`Vm::run`](crate::runtime::Vm::run) / [`run_root`] path.  `None`
+/// [`Vm::run`](crate::runtime::Vm::run) path.  `None`
 /// in a sync request (`eval` / `call` / `exec`), which cannot await,
 /// and outside any request.
 ///
@@ -618,7 +583,7 @@ pub fn current_scope() -> Option<ScopeHandle> {
 /// into it.  Obtained from [`current_scope`].
 ///
 /// A task spawned through the handle is structured like a Lua task
-/// started with `task.spawn` (see [`tasks`](crate::tasks)): when the
+/// started with `task.spawn` (see [the `task` library](crate::runtime#the-task-library)): when the
 /// request or task that owns the scope ends or is cancelled, the host
 /// task is cancelled, given the grace, dropped when the grace ends, and
 /// waited for before the request resolves.  A host future that never

@@ -280,12 +280,12 @@ impl AsyncIsleBuilder {
     ///
     /// Applied when the VM is attached, after the init closure: it
     /// replaces a config the init closure set (with
-    /// [`hooks::configure`](crate::hooks::configure) or
-    /// [`Vm::attach`](crate::runtime::Vm::attach)).  Without it, the VM
+    /// [`Vm::attach`](crate::runtime::Vm::attach) or
+    /// [`Vm::set_config`](crate::runtime::Vm::set_config)).  Without it, the VM
     /// keeps what the init closure set, or the default.
     ///
     /// The pools have no such setting yet: configure their VMs from the
-    /// factory closure (`hooks::configure` or `Vm::attach`).
+    /// factory closure (`Vm::attach`).
     ///
     /// ```rust
     /// # #[tokio::main]
@@ -884,12 +884,9 @@ fn run_async_loop(
 
 /// The [`Vm`](crate::runtime::Vm) of the isle's VM (attached at spawn).
 fn vm(lua: &mlua::Lua) -> Result<crate::runtime::Vm, IsleError> {
-    match crate::runtime::Vm::of(lua) {
-        Some(vm) => Ok(vm),
-        // Unreachable: the isle attaches before reporting a successful
-        // spawn.  Kept as a defensive path.
-        None => crate::runtime::attach_after_init(lua, None),
-    }
+    // The attach half is unreachable: the isle attaches before reporting
+    // a successful spawn.  Kept as a defensive path.
+    crate::runtime::of_or_attach(lua)
 }
 
 /// Execute Lua code as a coroutine request (see [`Vm::run`](crate::runtime::Vm::run)).

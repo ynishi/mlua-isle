@@ -78,19 +78,19 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mlua-isle = "0.7"
+mlua-isle = "0.8"
 
 # For async support (includes coroutine execution):
-# mlua-isle = { version = "0.7", features = ["tokio"] }
+# mlua-isle = { version = "0.8", features = ["tokio"] }
 
 # For connection pool:
-# mlua-isle = { version = "0.7", features = ["pool"] }
+# mlua-isle = { version = "0.8", features = ["pool"] }
 
 # Both:
-# mlua-isle = { version = "0.7", features = ["tokio", "pool"] }
+# mlua-isle = { version = "0.8", features = ["tokio", "pool"] }
 
 # The value a Lua error raised, as JSON, on `LuaFailure::value`:
-# mlua-isle = { version = "0.7", features = ["serde"] }
+# mlua-isle = { version = "0.8", features = ["serde"] }
 ```
 
 ### Sync API
@@ -303,31 +303,32 @@ Call `.detach()` to let it run without keeping the handle.
 
 ### Structured tasks (async)
 
-`tasks::install` gives Lua code a `task` library.  Tasks are structured:
+`vm.task_lib()` gives Lua code a `task` library.  Tasks are structured:
 cancelling a request cancels every task it spawned (and theirs), and a
 request, whether it finishes or is cancelled, does not resolve before
 the tasks it did not join have been cancelled and have finished or been
 dropped.  The cancel grace period is one deadline for the request and
 all of its tasks.  Host code joins the same structure through
 `runtime::current_scope()` (see [Host tasks](#host-tasks-in-the-requests-scope)).
-Dropping a `run_root` future (rather than cancelling its token and
+Dropping a `vm.run` future (rather than cancelling its token and
 awaiting it) only schedules its tasks for abort.
 
 ```rust
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-use mlua_isle::hooks::{self, CancelConfig};
-use mlua_isle::{cancellable, tasks, AsyncIsle};
+use mlua_isle::runtime::{cancellable, Config, Vm};
+use mlua_isle::AsyncIsle;
 use std::time::Duration;
 
 let (isle, driver) = AsyncIsle::spawn(|lua| {
-    hooks::configure(lua, CancelConfig {
+    let vm = Vm::attach(lua, Config {
         // A cancelled coroutine may run its cleanup for up to 100 ms.
         grace: Duration::from_millis(100),
         // Yield CPU-bound tasks so that siblings can run and cancel them.
         preempt_every: Some(1),
-    });
-    lua.globals().set("task", tasks::install(lua)?)?;
+    })?;
+    // `?` converts `IsleError` into the closure's `mlua::Error`.
+    lua.globals().set("task", vm.task_lib()?)?;
     // `cancellable` turns a cancel into a Lua error at this await point,
     // so `__close` handlers of the coroutine run and may await.
     let sleep = lua.create_async_function(|_, ms: u64| {
@@ -359,15 +360,16 @@ driver.shutdown().await?;
 ```
 
 The isle owns the VM's Lua debug hook.  Register your own hook callbacks
-with `hooks::add_hook` rather than `Lua::set_hook`, which would replace
-the cancel hook.
+with `vm.add_hook` rather than `Lua::set_hook`, which would replace
+the cancel hook.  The config can also be set without the init closure,
+through `AsyncIsle::builder().config(..)`.
 
 ### Errors
 
 Every function returns `IsleError`.  A Lua error of a request or root is
 `IsleError::Lua(LuaFailure)`, built on the VM thread from the raised
 value, the same on every path (`Isle`, `AsyncIsle` sync and coroutine
-requests, `Vm::run` / `run_root`):
+requests, `Vm::run`):
 
 ```rust
 use mlua_isle::{Isle, IsleError, LuaErrorKind};
@@ -443,7 +445,7 @@ the running request or task.  The task is then structured like a
 cancelled, gets the grace (the same deadline as the rest of the tree),
 is dropped when the grace ends even if it never looks at its token, and
 the request resolves only after it is gone.  This works on the
-`AsyncIsle` path and on `vm.run` / `run_root`.
+`AsyncIsle` path and on `vm.run`.
 
 ```rust
 use mlua_isle::runtime::current_scope;
@@ -523,15 +525,19 @@ returning.
 | `task.cancel()` | Cancel the running task |
 | `task.cancel_token()` | Access the `CancelToken` for sharing |
 | `task.detach()` | Let the task run without the handle (dropping it cancels) |
-| `tasks::install(lua)` | Lua `task` library: `spawn` / `join` / `cancel` / `done` / `is_cancelled` |
-| `hooks::configure(lua, config)` | Cancel grace period and preemption |
-| `hooks::add_hook(lua, triggers, f)` | Register a Lua hook callback next to the cancel hook |
-| `cancellable(fut)` | Make an async host function stop at cancel |
-| `current_token()` | Token of the running request / task (derive child tokens) |
-| `run_root(lua, token, f, args)` | Run a coroutine with task support on a VM you drive |
-| `runtime::Vm::attach(lua, config)` | Take over a VM you own: hook, `Config`, `task` table |
-| `vm.task_lib()` | The `task` table, created on first call (not set as a global) |
-| `vm.run(&token, f, args)` | Run a root coroutine; resolves after its tasks ended |
+
+### In-thread layer (`runtime`)
+
+| Item | Description |
+|------|-------------|
+| `runtime::Vm::attach(lua, config)` | Take over a VM: hook, `Config`, `task` table (no feature) |
+| `vm.config()` / `vm.set_config(config)` | Cancel grace period and preemption (`runtime::Config`) |
+| `vm.add_hook(triggers, f)` / `vm.remove_hook(id)` | Register a Lua hook callback next to the cancel hook |
+| `vm.task_lib()` | Lua `task` library: `spawn` / `join` / `cancel` / `done` / `is_cancelled`; created on first call, not set as a global (`tokio`) |
+| `vm.run(&token, f, args)` | Run a root coroutine; resolves after its tasks ended (`tokio`) |
+| `runtime::cancellable(fut)` | Make an async host function stop at cancel (`tokio`) |
+| `runtime::current_token()` | Token of the running request / task (derive child tokens) |
+| `runtime::current_scope()` | Scope of the running request / task, for host tasks (`tokio`) |
 
 ### Pool (`IslePool`, `pool` feature)
 
@@ -545,6 +551,25 @@ returning.
 | `pool.idle()` | Number of idle Isles |
 | `pool.shutdown()` | Shut down all idle Isles |
 | `pooled.kill()` | Mark Isle for disposal on drop |
+
+## Versioning
+
+`mlua-isle` is `0.y` and stays `0.y` while `mlua`, whose types are in its
+public API, is `0.y`.  A `y` bump is a breaking release; the rules:
+
+1. A return type or error payload that has the wrong shape is changed in
+   place, and the change ships as the next `0.(y+1).0`.  No twin
+   function is added under another name (no `eval_as`, no `_raw`).
+2. The CHANGELOG entry under **Breaking** names the old and the new
+   signature and gives the one-line migration (add the type annotation,
+   or match the new variant).
+3. `#[deprecated]` is used only for renames where the old name forwards
+   to the new one (as the 0.7 in-thread API does to `runtime` in 0.8),
+   and those are removed in the release after.  It is never used to keep
+   a `String` twin of a generic function.
+4. A type that is right long term is preferred over one that avoids the
+   bump: while the crate is `0.y`, the bump is the normal release
+   cadence, not an exception.
 
 ## Minimum Supported Rust Version
 

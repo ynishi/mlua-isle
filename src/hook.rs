@@ -3,7 +3,7 @@
 //! A [`CancelToken`] is a shared `AtomicBool` that can be checked from
 //! both Rust code and a Lua debug hook.  When the token of the request
 //! (or task) currently executing is cancelled, the cancel hook (see
-//! [`hooks`](crate::hooks)) raises `mlua::Error::external(Cancelled)`
+//! [Hooks](crate::runtime#hooks)) raises `mlua::Error::external(Cancelled)`
 //! (see [`Cancelled`](crate::Cancelled)), which
 //! [`IsleError::from(mlua::Error)`](crate::IsleError) recognises by
 //! downcast.

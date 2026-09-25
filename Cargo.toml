@@ -1,6 +1,6 @@
 [package]
 name = "mlua-isle"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Thread-isolated Lua VM with cancellation, async coroutines, and connection pool for mlua"

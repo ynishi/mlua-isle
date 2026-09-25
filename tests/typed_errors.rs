@@ -90,13 +90,16 @@ mod sync_isle {
         let a = armed.clone();
         let isle = Isle::spawn(move |lua| {
             let h = armed.clone();
-            mlua_isle::hooks::add_hook(lua, mlua::HookTriggers::new().every_line(), move |_, _| {
-                if h.swap(false, Ordering::SeqCst) {
-                    return Err(mlua::Error::runtime("hook failed"));
-                }
-                Ok(mlua::VmState::Continue)
-            })
-            .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            mlua_isle::runtime::Vm::attach(lua, Default::default())
+                .and_then(|vm| {
+                    vm.add_hook(mlua::HookTriggers::new().every_line(), move |_, _| {
+                        if h.swap(false, Ordering::SeqCst) {
+                            return Err(mlua::Error::runtime("hook failed"));
+                        }
+                        Ok(mlua::VmState::Continue)
+                    })
+                })
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let arm = lua.create_function(move |_, ()| {
                 a.store(true, Ordering::SeqCst);
                 Ok(())
@@ -187,8 +190,9 @@ mod sync_isle {
 #[cfg(feature = "tokio")]
 mod runtime_paths {
     use super::*;
+    use mlua_isle::runtime::cancellable;
     use mlua_isle::runtime::{CancelToken, Config, Vm};
-    use mlua_isle::{cancellable, AsyncIsle};
+    use mlua_isle::AsyncIsle;
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::Duration;
@@ -283,7 +287,7 @@ mod runtime_paths {
         }
     }
 
-    // ── Vm::run / run_root ───────────────────────────────────────────────
+    // ── Vm::run ───────────────────────────────────────────────────────
 
     #[test]
     fn run_of_a_raised_table_keeps_its_message_and_value() {

@@ -7,7 +7,7 @@
 //! raised value.  It is built on the VM thread, so it is `Send`.
 //!
 //! Cancellation is a value, not a message: the cancel hook and
-//! [`cancellable`](crate::cancellable) raise
+//! [`cancellable`](crate::runtime::cancellable) raise
 //! `mlua::Error::external(Cancelled)`, and Rust recognises it by
 //! downcasting (see [`Cancelled`]).
 
@@ -249,7 +249,7 @@ fn split_traceback(msg: &str) -> (String, Option<String>) {
 
 /// The error a cancellation raises in Lua.
 ///
-/// The cancel hook and [`cancellable`](crate::cancellable) raise
+/// The cancel hook and [`cancellable`](crate::runtime::cancellable) raise
 /// `mlua::Error::external(Cancelled)`.  Rust recognises it by value, with
 /// [`mlua::Error::downcast_ref`], which walks the `CallbackError` /
 /// `WithContext` / `BadArgument` chain down to the `ExternalError`:
@@ -266,7 +266,7 @@ fn split_traceback(msg: &str) -> (String, Option<String>) {
 ///
 /// Lua code sees it as an error value (a userdata whose `tostring` is
 /// `cancelled` plus a traceback); the `task` library's
-/// `task.is_cancelled(err)` is true for it (see [`tasks`](crate::tasks)).
+/// `task.is_cancelled(err)` is true for it (see [the `task` library](crate::runtime#the-task-library)).
 /// A host function that wants to report a cancel it observed itself can
 /// return `Err(mlua::Error::external(Cancelled))`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -280,9 +280,11 @@ impl fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-/// Whether `e` is (or wraps) the cancellation error.
+/// Whether `e` is (or wraps) the cancellation error: [`Cancelled`], or
+/// an [`IsleError::Cancelled`] passed through `mlua::Error::external`.
 pub(crate) fn is_cancel(e: &mlua::Error) -> bool {
     e.downcast_ref::<Cancelled>().is_some()
+        || matches!(e.downcast_ref::<IsleError>(), Some(IsleError::Cancelled))
 }
 
 /// The cancellation error, as raised into Lua.
@@ -298,6 +300,30 @@ impl From<mlua::Error> for IsleError {
             Self::Cancelled
         } else {
             Self::Lua(LuaFailure::from_mlua(&e))
+        }
+    }
+}
+
+impl From<IsleError> for mlua::Error {
+    /// Lets `?` pass an `IsleError` out of a closure or host function that
+    /// returns `mlua::Result` (an init closure, a `create_function` /
+    /// `create_async_function` body).
+    ///
+    /// [`IsleError::Cancelled`] becomes `mlua::Error::external(`[`Cancelled`]`)`,
+    /// the same value the cancel hook raises, so a cancel stays a cancel
+    /// across the boundary: `task.is_cancelled(err)` is true for it in
+    /// Lua, and `IsleError::from` turns it back into
+    /// `IsleError::Cancelled`.  Every other variant becomes
+    /// `mlua::Error::external(e)`; brought back to Rust it is
+    /// `IsleError::Lua(f)` with `f.message` = `e.to_string()`, and
+    /// `f.kind` = [`LuaErrorKind::Callback`] when it came out of a host
+    /// function called from Lua ([`LuaErrorKind::External`] when it
+    /// did not cross a Lua call, e.g. from an init closure, which gives
+    /// `IsleError::Init`).
+    fn from(e: IsleError) -> Self {
+        match e {
+            IsleError::Cancelled => cancel_error(),
+            e => mlua::Error::external(e),
         }
     }
 }
