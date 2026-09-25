@@ -272,7 +272,7 @@ async fn a_cancelled_requests_detached_host_task_is_gone_before_the_next_request
 async fn case_a(handle: Handle) {
     let ticks = Arc::new(AtomicUsize::new(0));
     let (isle, driver) = ticker_isle(Duration::ZERO, ticks.clone(), handle).await;
-    let task = isle.spawn_coroutine_eval("ticker() hold(5000)");
+    let task = isle.spawn_coroutine_eval::<()>("ticker() hold(5000)");
     // With a zero grace a cancelled task gets one poll, so one tick; a
     // second tick shows the handle (held or detached) did not cancel it.
     wait_for_ticks(&ticks, 2).await;
@@ -283,7 +283,9 @@ async fn case_a(handle: Handle) {
     ));
     let at_resolve = ticks.load(Ordering::SeqCst);
 
-    within(5000, isle.coroutine_eval("hold(50)")).await.unwrap();
+    within(5000, isle.coroutine_eval::<()>("hold(50)"))
+        .await
+        .unwrap();
     assert_eq!(
         ticks.load(Ordering::SeqCst),
         at_resolve,
@@ -307,7 +309,7 @@ async fn shutdown_returns_after_cancelling_a_request_with_a_detached_token_blind
 async fn case_b(handle: Handle) {
     let ticks = Arc::new(AtomicUsize::new(0));
     let (isle, driver) = ticker_isle(Duration::from_millis(100), ticks.clone(), handle).await;
-    let task = isle.spawn_coroutine_eval("ticker() hold(5000)");
+    let task = isle.spawn_coroutine_eval::<()>("ticker() hold(5000)");
     wait_for_ticks(&ticks, 2).await;
     task.cancel();
     assert!(matches!(
@@ -377,11 +379,14 @@ async fn current_scope_is_none_in_a_sync_request_and_some_in_a_coroutine_request
     })
     .await
     .unwrap();
-    assert_eq!(isle.eval("return has_scope()").await.unwrap(), "false");
-    assert_eq!(
-        isle.coroutine_eval("return has_scope()").await.unwrap(),
-        "true"
-    );
+    assert!(isle
+        .eval::<bool>("return has_scope() == false")
+        .await
+        .unwrap());
+    assert!(isle
+        .coroutine_eval::<bool>("return has_scope() == true")
+        .await
+        .unwrap());
     assert!(current_scope().is_none());
     driver.shutdown().await.unwrap();
 }

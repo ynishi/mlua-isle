@@ -201,8 +201,8 @@ mod with_tokio {
     /// Cancel a coroutine request whose `__close` awaits 20 ms, and
     /// report whether that cleanup finished.
     async fn cleanup_finished(isle: &AsyncIsle) -> bool {
-        isle.eval("cleaned = false").await.unwrap();
-        let task = isle.spawn_coroutine_eval(
+        isle.eval::<()>("cleaned = false").await.unwrap();
+        let task = isle.spawn_coroutine_eval::<()>(
             "local g <close> = setmetatable({}, { __close = function()
                hold(20)
                cleaned = true
@@ -215,7 +215,7 @@ mod with_tokio {
             .await
             .expect("timed out");
         assert!(matches!(r.unwrap_err(), IsleError::Cancelled));
-        isle.eval("return cleaned").await.unwrap() == "true"
+        isle.eval::<bool>("return cleaned == true").await.unwrap()
     }
 
     #[tokio::test]

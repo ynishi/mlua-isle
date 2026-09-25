@@ -56,8 +56,8 @@ fn cold_checkout_eval() {
     .unwrap();
 
     let isle = pool.checkout().unwrap();
-    let result = isle.eval("return base + 5").unwrap();
-    assert_eq!(result, "15");
+    let result: i64 = isle.eval("return base + 5").unwrap();
+    assert_eq!(result, 15);
 
     pool.shutdown();
 }
@@ -76,14 +76,14 @@ fn cold_does_not_preserve_state() {
     // First checkout: set a global
     {
         let isle = pool.checkout().unwrap();
-        isle.eval("my_global = 42").unwrap();
+        isle.eval::<()>("my_global = 42").unwrap();
     }
     // PooledIsle dropped → Isle destroyed (cold)
 
     // Second checkout: global must NOT exist
     {
         let isle = pool.checkout().unwrap();
-        let result = isle.eval("return type(my_global)").unwrap();
+        let result: String = isle.eval("return type(my_global)").unwrap();
         assert_eq!(result, "nil", "cold pool must not preserve state");
     }
 
@@ -109,8 +109,8 @@ fn warm_checkout_eval() {
     .unwrap();
 
     let isle = pool.checkout().unwrap();
-    let result = isle.eval("return base + 5").unwrap();
-    assert_eq!(result, "15");
+    let result: i64 = isle.eval("return base + 5").unwrap();
+    assert_eq!(result, 15);
 
     pool.shutdown();
 }
@@ -129,15 +129,15 @@ fn warm_preserves_state() {
     // First checkout: set a global
     {
         let isle = pool.checkout().unwrap();
-        isle.eval("my_global = 42").unwrap();
+        isle.eval::<()>("my_global = 42").unwrap();
     }
     // PooledIsle dropped → Isle returned to pool (warm)
 
     // Second checkout: global must still exist
     {
         let isle = pool.checkout().unwrap();
-        let result = isle.eval("return my_global").unwrap();
-        assert_eq!(result, "42", "warm pool must preserve state");
+        let result: i64 = isle.eval("return my_global").unwrap();
+        assert_eq!(result, 42, "warm pool must preserve state");
     }
 
     pool.shutdown();
@@ -181,7 +181,7 @@ fn try_checkout_succeeds_when_available() {
     let isle = pool.try_checkout().unwrap();
     assert!(isle.is_some(), "should return Some when available");
     let isle = isle.unwrap();
-    assert_eq!(isle.eval("return 1").unwrap(), "1");
+    assert_eq!(isle.eval::<i64>("return 1").unwrap(), 1);
 
     pool.shutdown();
 }
@@ -232,7 +232,7 @@ fn checkout_blocks_then_succeeds_after_return() {
         let start = Instant::now();
         let isle = pool_c.checkout_timeout(Duration::from_secs(5)).unwrap();
         let elapsed = start.elapsed();
-        let result = isle.eval("return 'waited'").unwrap();
+        let result: String = isle.eval("return 'waited'").unwrap();
         (result, elapsed)
     });
 
@@ -273,8 +273,8 @@ fn concurrent_checkouts_all_succeed() {
             std::thread::spawn(move || {
                 let isle = pool.checkout().unwrap();
                 let code = format!("return {} * 2", i);
-                let result = isle.eval(&code).unwrap();
-                assert_eq!(result, (i * 2).to_string());
+                let result: i64 = isle.eval(&code).unwrap();
+                assert_eq!(result, i * 2);
             })
         })
         .collect();
@@ -302,7 +302,7 @@ fn pooled_isle_spawn_eval_and_cancel() {
     .unwrap();
 
     let isle = pool.checkout().unwrap();
-    let task = isle.spawn_eval("while true do end");
+    let task = isle.spawn_eval::<()>("while true do end");
 
     // Cancel after short delay
     std::thread::sleep(Duration::from_millis(20));
@@ -343,7 +343,7 @@ fn pooled_isle_call() {
     .unwrap();
 
     let isle = pool.checkout().unwrap();
-    let result = isle.call("add", &["3", "4"]).unwrap();
+    let result: String = isle.call("add", ("3", "4")).unwrap();
     assert_eq!(result, "7");
 
     pool.shutdown();
@@ -364,10 +364,10 @@ fn pooled_isle_exec() {
     let result = isle
         .exec(|lua| {
             let val: i64 = lua.load("return 99").eval()?;
-            Ok(val.to_string())
+            Ok(val)
         })
         .unwrap();
-    assert_eq!(result, "99");
+    assert_eq!(result, 99);
 
     pool.shutdown();
 }
@@ -389,14 +389,14 @@ fn kill_discards_and_next_checkout_gets_fresh_isle() {
 
     {
         let isle = pool.checkout().unwrap();
-        isle.eval("sentinel = 'old'").unwrap();
+        isle.eval::<()>("sentinel = 'old'").unwrap();
         isle.kill();
     }
     // Killed → discarded, not returned to pool
 
     {
         let isle = pool.checkout().unwrap();
-        let result = isle.eval("return type(sentinel)").unwrap();
+        let result: String = isle.eval("return type(sentinel)").unwrap();
         assert_eq!(
             result, "nil",
             "kill() must discard the isle; fresh checkout should have clean state"
@@ -451,7 +451,7 @@ fn shutdown_cleans_up_idle_isles() {
     // Spawn 3 isles, return them all
     for _ in 0..3 {
         let isle = pool.checkout().unwrap();
-        isle.eval("return 1").unwrap();
+        isle.eval::<i64>("return 1").unwrap();
     }
 
     // All 3 are now idle in the pool

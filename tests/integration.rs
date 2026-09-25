@@ -5,31 +5,31 @@ use std::time::{Duration, Instant};
 #[test]
 fn eval_simple_expression() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let result = isle.eval("return 1 + 2").unwrap();
-    assert_eq!(result, "3");
+    let result: i64 = isle.eval("return 1 + 2").unwrap();
+    assert_eq!(result, 3);
     isle.shutdown().unwrap();
 }
 
 #[test]
 fn eval_string_result() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let result = isle.eval("return 'hello world'").unwrap();
+    let result: String = isle.eval("return 'hello world'").unwrap();
     assert_eq!(result, "hello world");
     isle.shutdown().unwrap();
 }
 
 #[test]
-fn eval_nil_returns_empty() {
+fn eval_nil_is_none() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let result = isle.eval("return nil").unwrap();
-    assert_eq!(result, "");
+    let result: Option<String> = isle.eval("return nil").unwrap();
+    assert_eq!(result, None);
     isle.shutdown().unwrap();
 }
 
 #[test]
 fn eval_lua_error_propagates() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let result = isle.eval("error('boom')");
+    let result = isle.eval::<()>("error('boom')");
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -47,8 +47,8 @@ fn init_sets_globals() {
     })
     .unwrap();
 
-    let result = isle.eval("return my_val").unwrap();
-    assert_eq!(result, "42");
+    let result: i64 = isle.eval("return my_val").unwrap();
+    assert_eq!(result, 42);
     isle.shutdown().unwrap();
 }
 
@@ -70,7 +70,7 @@ fn call_global_function() {
     })
     .unwrap();
 
-    let result = isle.call("greet", &["hello", "world"]).unwrap();
+    let result: String = isle.call("greet", ("hello", "world")).unwrap();
     assert_eq!(result, "hello, world");
     isle.shutdown().unwrap();
 }
@@ -78,7 +78,7 @@ fn call_global_function() {
 #[test]
 fn spawn_eval_cancel_infinite_loop() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let task = isle.spawn_eval("while true do end");
+    let task = isle.spawn_eval::<()>("while true do end");
 
     // Cancel after a short delay
     std::thread::sleep(Duration::from_millis(50));
@@ -111,8 +111,8 @@ fn multiple_sequential_evals() {
     .unwrap();
 
     for i in 1..=5 {
-        let result = isle.eval("counter = counter + 1; return counter").unwrap();
-        assert_eq!(result, i.to_string());
+        let result: i64 = isle.eval("counter = counter + 1; return counter").unwrap();
+        assert_eq!(result, i);
     }
 
     isle.shutdown().unwrap();
@@ -124,19 +124,19 @@ fn exec_closure() {
 
     let result = isle
         .exec(|lua| {
-            let val: i64 = lua.load("return 7 * 6").eval().map_err(IsleError::from)?;
-            Ok(val.to_string())
+            let val: i64 = lua.load("return 7 * 6").eval()?;
+            Ok(val)
         })
         .unwrap();
 
-    assert_eq!(result, "42");
+    assert_eq!(result, 42);
     isle.shutdown().unwrap();
 }
 
 #[test]
 fn shutdown_after_drop_is_safe() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let _ = isle.eval("return 1");
+    let _ = isle.eval::<()>("return 1");
     // Drop without explicit shutdown — should not panic
     drop(isle);
 }
@@ -177,7 +177,7 @@ fn spawn_eval_after_drop_returns_shutdown() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
     // Use spawn_eval before dropping — but we need to test the failure path.
     // The only way to exercise it without unsafe is to race: drop on another thread.
-    let task = isle.spawn_eval("return 1");
+    let task = isle.spawn_eval::<i64>("return 1");
     let result = task.wait();
     // This should succeed since we haven't dropped yet
     assert!(result.is_ok());
@@ -193,7 +193,7 @@ fn spawn_call_returns_correct_result_after_init() {
     })
     .unwrap();
 
-    let result = isle.call("add", &["3", "4"]).unwrap();
+    let result: String = isle.call("add", ("3", "4")).unwrap();
     assert_eq!(result, "7");
     isle.shutdown().unwrap();
 }
@@ -222,7 +222,7 @@ fn spawn_exec_cancel() {
 #[test]
 fn try_recv_returns_none_then_some() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let task = isle.spawn_eval("return 'async'");
+    let task = isle.spawn_eval::<String>("return 'async'");
 
     // Poll until result arrives (should be fast)
     let mut result = None;
@@ -241,7 +241,7 @@ fn try_recv_returns_none_then_some() {
 #[test]
 fn cancel_token_accessor() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let task = isle.spawn_eval("return 1");
+    let task = isle.spawn_eval::<()>("return 1");
 
     let token = task.cancel_token();
     assert!(!token.is_cancelled());
@@ -269,8 +269,8 @@ fn concurrent_evals_from_multiple_threads() {
             std::thread::spawn(move || {
                 for i in 0..evals_per_thread {
                     let code = format!("return {} + {}", t, i);
-                    let result = isle.eval(&code).unwrap();
-                    let expected = (t + i).to_string();
+                    let result: i64 = isle.eval(&code).unwrap();
+                    let expected = i64::from(t + i);
                     assert_eq!(result, expected, "thread {t}, iter {i}");
                 }
             })
@@ -295,7 +295,7 @@ fn concurrent_spawn_eval_with_cancel() {
     // Spawn a long-running task and several quick tasks concurrently
     let isle_c = Arc::clone(&isle);
     let long_handle = std::thread::spawn(move || {
-        let task = isle_c.spawn_eval("while true do end");
+        let task = isle_c.spawn_eval::<()>("while true do end");
         std::thread::sleep(Duration::from_millis(30));
         task.cancel();
         let result = task.wait();
@@ -305,7 +305,7 @@ fn concurrent_spawn_eval_with_cancel() {
     long_handle.join().expect("long task thread panicked");
 
     // After cancel, Isle should still accept new requests
-    let result = isle.eval("return 'still alive'").unwrap();
+    let result: String = isle.eval("return 'still alive'").unwrap();
     assert_eq!(result, "still alive");
 
     Arc::try_unwrap(isle)
@@ -323,12 +323,12 @@ async fn eval_from_tokio_spawn_blocking() {
     let isle = Arc::new(Isle::spawn(|_lua| Ok(())).unwrap());
 
     let isle_c = Arc::clone(&isle);
-    let result = tokio::task::spawn_blocking(move || isle_c.eval("return 1 + 1"))
+    let result = tokio::task::spawn_blocking(move || isle_c.eval::<i64>("return 1 + 1"))
         .await
         .expect("spawn_blocking panicked")
         .unwrap();
 
-    assert_eq!(result, "2");
+    assert_eq!(result, 2);
 
     Arc::try_unwrap(isle)
         .unwrap_or_else(|_| panic!("other Arc references remain"))
@@ -346,8 +346,8 @@ async fn multiple_tokio_tasks_share_isle() {
         let isle_c = Arc::clone(&isle);
         join_handles.push(tokio::task::spawn_blocking(move || {
             let code = format!("return {i} * 2");
-            let result = isle_c.eval(&code).unwrap();
-            assert_eq!(result, (i * 2).to_string());
+            let result: i64 = isle_c.eval(&code).unwrap();
+            assert_eq!(result, (i * 2) as i64);
         }));
     }
 
@@ -367,7 +367,7 @@ async fn cancel_from_tokio_task() {
 
     let isle_c = Arc::clone(&isle);
     let result = tokio::task::spawn_blocking(move || {
-        let task = isle_c.spawn_eval("while true do end");
+        let task = isle_c.spawn_eval::<()>("while true do end");
         std::thread::sleep(Duration::from_millis(50));
         task.cancel();
         task.wait()
@@ -379,7 +379,7 @@ async fn cancel_from_tokio_task() {
 
     // Isle still functional after cancel
     let isle_c = Arc::clone(&isle);
-    let result = tokio::task::spawn_blocking(move || isle_c.eval("return 'ok'"))
+    let result = tokio::task::spawn_blocking(move || isle_c.eval::<String>("return 'ok'"))
         .await
         .expect("spawn_blocking panicked")
         .unwrap();
@@ -396,7 +396,7 @@ async fn shutdown_from_tokio() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
 
     let result = tokio::task::spawn_blocking(move || {
-        let _ = isle.eval("return 1");
+        let _ = isle.eval::<()>("return 1");
         isle.shutdown()
     })
     .await
@@ -409,7 +409,7 @@ async fn shutdown_from_tokio() {
 #[test]
 fn spawn_eval_cancel_loop_in_lua_created_coroutine() {
     let isle = Isle::spawn(|_lua| Ok(())).unwrap();
-    let task = isle.spawn_eval("coroutine.wrap(function() while true do end end)()");
+    let task = isle.spawn_eval::<()>("coroutine.wrap(function() while true do end end)()");
 
     std::thread::sleep(Duration::from_millis(50));
     task.cancel();
@@ -428,7 +428,7 @@ fn spawn_eval_cancel_loop_in_lua_created_coroutine() {
     assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
 
     // The isle is still usable.
-    assert_eq!(isle.eval("return 1").unwrap(), "1");
+    assert_eq!(isle.eval::<i64>("return 1").unwrap(), 1);
     isle.shutdown().unwrap();
 }
 
@@ -445,7 +445,7 @@ impl std::fmt::Display for MyErr {
 
 impl std::error::Error for MyErr {}
 
-fn lua_failure(r: Result<String, IsleError>) -> mlua_isle::LuaFailure {
+fn lua_failure(r: Result<(), IsleError>) -> mlua_isle::LuaFailure {
     match r {
         Err(IsleError::Lua(f)) => f,
         other => panic!("expected IsleError::Lua, got: {other:?}"),
@@ -530,8 +530,8 @@ fn eval_error_with_the_old_sentinel_is_not_a_cancel() {
 fn cancelled_eval_is_cancelled_even_when_lua_replaces_the_error() {
     let isle = Isle::spawn(|_| Ok(())).unwrap();
     // The Lua code catches the cancel and raises a string instead.
-    let task =
-        isle.spawn_eval("local ok = pcall(function() while true do end end) error('swallowed')");
+    let task = isle
+        .spawn_eval::<()>("local ok = pcall(function() while true do end end) error('swallowed')");
     std::thread::sleep(Duration::from_millis(20));
     task.cancel();
     assert!(matches!(task.wait(), Err(IsleError::Cancelled)));
@@ -541,8 +541,8 @@ fn cancelled_eval_is_cancelled_even_when_lua_replaces_the_error() {
 #[test]
 fn call_of_a_missing_global_is_not_found() {
     let isle = Isle::spawn(|lua| lua.globals().set("n", 1)).unwrap();
-    assert!(matches!(isle.call("nope", &[]), Err(IsleError::NotFound(n)) if n == "nope"));
-    assert!(matches!(isle.call("n", &[]), Err(IsleError::NotFound(n)) if n == "n"));
+    assert!(matches!(isle.call::<_, ()>("nope", ()), Err(IsleError::NotFound(n)) if n == "nope"));
+    assert!(matches!(isle.call::<_, ()>("n", ()), Err(IsleError::NotFound(n)) if n == "n"));
     isle.shutdown().unwrap();
 }
 
@@ -578,7 +578,10 @@ fn request_panic_is_recv_failed_then_thread_panic_on_shutdown() {
         lua.globals().set("boom", boom)
     })
     .unwrap();
-    assert!(matches!(isle.eval("boom()"), Err(IsleError::RecvFailed)));
+    assert!(matches!(
+        isle.eval::<()>("boom()"),
+        Err(IsleError::RecvFailed)
+    ));
     let err = isle.shutdown().unwrap_err();
     assert!(
         matches!(&err, IsleError::ThreadPanic(Some(m)) if m == "request boom"),

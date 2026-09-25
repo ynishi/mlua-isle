@@ -507,7 +507,7 @@ async fn with_grace<F: Future>(scope: &Scope, fut: F) -> Option<F::Output> {
 ///     lua.globals().set("sleep", sleep)
 /// })
 /// .await?;
-/// isle.coroutine_eval("sleep(1)").await?;
+/// isle.coroutine_eval::<()>("sleep(1)").await?;
 /// driver.shutdown().await?;
 /// # Ok(())
 /// # }

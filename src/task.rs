@@ -9,7 +9,11 @@ use crate::error::IsleError;
 use crate::hook::CancelToken;
 use std::sync::mpsc;
 
-/// Handle to a pending Lua operation.
+/// Handle to a pending Lua operation whose result is a `T`.
+///
+/// `T` is the type the request converts its result to on the Lua
+/// thread (the `T` of [`Isle::eval`](crate::Isle::eval) and the other
+/// request methods).
 ///
 /// The operation runs on the Lua thread.  The caller can:
 /// - [`wait`](Task::wait) for the result (blocking).
@@ -20,7 +24,7 @@ use std::sync::mpsc;
 /// operation.  Call [`detach`](Task::detach) to let it run to completion
 /// without keeping the handle.
 #[must_use = "dropping a Task cancels the operation; use `.detach()` to let it run"]
-pub struct Task<T = String> {
+pub struct Task<T> {
     rx: mpsc::Receiver<Result<T, IsleError>>,
     cancel: CancelToken,
     /// Result received or detached: dropping must not cancel.

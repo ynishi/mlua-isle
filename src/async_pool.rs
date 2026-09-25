@@ -44,7 +44,7 @@
 //!
 //! {
 //!     let isle = pool.checkout().await?;
-//!     assert_eq!(isle.eval("return greeting").await?, "hello");
+//!     assert_eq!(isle.eval::<String>("return greeting").await?, "hello");
 //! } // returned to pool on drop
 //!
 //! pool.shutdown().await;

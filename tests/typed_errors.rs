@@ -53,8 +53,8 @@ mod sync_isle {
     #[test]
     fn sync_eval_survives_init_removing_xpcall() {
         let isle = Isle::spawn(|lua| lua.globals().set("xpcall", mlua::Value::Nil)).unwrap();
-        assert_eq!(isle.eval("return 1 + 1").unwrap(), "2");
-        let f = failure(isle.eval("error({ code = 1 })"));
+        assert_eq!(isle.eval::<i64>("return 1 + 1").unwrap(), 2);
+        let f = failure(isle.eval::<()>("error({ code = 1 })"));
         assert_eq!(f.kind, LuaErrorKind::Runtime);
         assert!(f.traceback.is_some());
         isle.shutdown().unwrap();
@@ -63,8 +63,8 @@ mod sync_isle {
     #[test]
     fn sync_eval_survives_whitelisted_globals() {
         let isle = Isle::spawn(sandbox).unwrap();
-        assert_eq!(isle.eval("return 40 + 2").unwrap(), "42");
-        let f = failure(isle.eval("error('x')"));
+        assert_eq!(isle.eval::<i64>("return 40 + 2").unwrap(), 42);
+        let f = failure(isle.eval::<()>("error('x')"));
         assert_eq!(f.message, "eval:1: x");
         assert!(f.traceback.is_some(), "the message handler did not run");
         isle.shutdown().unwrap();
@@ -73,11 +73,11 @@ mod sync_isle {
     #[test]
     fn sync_memory_error_is_memory() {
         let isle = Isle::spawn(|lua| lua.set_memory_limit(1 << 20).map(drop)).unwrap();
-        let f = failure(isle.eval(ALLOC_LOOP));
+        let f = failure(isle.eval::<()>(ALLOC_LOOP));
         assert_eq!(f.kind, LuaErrorKind::Memory, "got: {f:?}");
         assert_eq!(f.traceback, None);
         // The VM still serves.
-        assert_eq!(isle.eval("return 1").unwrap(), "1");
+        assert_eq!(isle.eval::<i64>("return 1").unwrap(), 1);
         isle.shutdown().unwrap();
     }
 
@@ -104,7 +104,7 @@ mod sync_isle {
             lua.globals().set("arm", arm)
         })
         .unwrap();
-        let f = failure(isle.eval("arm() error('original')"));
+        let f = failure(isle.eval::<()>("arm() error('original')"));
         assert_eq!(f.message, "eval:1: original");
         assert_eq!(f.kind, LuaErrorKind::Runtime);
         isle.shutdown().unwrap();
@@ -113,10 +113,10 @@ mod sync_isle {
     #[test]
     fn sync_memory_error_in_close_after_an_error_is_memory() {
         let isle = Isle::spawn(|lua| lua.set_memory_limit(1 << 20).map(drop)).unwrap();
-        let f = failure(isle.eval(CLOSE_OOM));
+        let f = failure(isle.eval::<()>(CLOSE_OOM));
         assert_eq!(f.kind, LuaErrorKind::Memory, "got: {f:?}");
         assert_eq!(f.traceback, None);
-        assert_eq!(isle.eval("return 1").unwrap(), "1");
+        assert_eq!(isle.eval::<i64>("return 1").unwrap(), 1);
         isle.shutdown().unwrap();
     }
 
@@ -135,7 +135,7 @@ mod sync_isle {
     #[test]
     fn a_cyclic_table_has_no_value_and_keeps_its_message() {
         let isle = Isle::spawn(|_| Ok(())).unwrap();
-        let f = failure(isle.eval(
+        let f = failure(isle.eval::<()>(
             "local t = setmetatable({}, { __tostring = function() return 'cyclic' end })
              t.self = t
              error(t)",
@@ -157,7 +157,7 @@ mod sync_isle {
             lua.globals().set("fail", fail)
         })
         .unwrap();
-        let f = failure(isle.eval("fail()"));
+        let f = failure(isle.eval::<()>("fail()"));
         assert_eq!(f.kind, LuaErrorKind::Callback);
         assert_eq!(f.message, "my error 3");
         isle.shutdown().unwrap();
@@ -499,14 +499,14 @@ mod runtime_paths {
                 .await
                 .unwrap();
 
-        assert_e42(&failure(isle.eval(RAISE).await));
-        assert_e42(&failure(isle.coroutine_eval(RAISE).await));
-        assert_e42(&failure(isle.call("raise", &[]).await));
-        assert_e42(&failure(isle.coroutine_call("raise", &[]).await));
-        assert_e42(&failure(isle.spawn_coroutine_eval(RAISE).await));
+        assert_e42(&failure(isle.eval::<()>(RAISE).await));
+        assert_e42(&failure(isle.coroutine_eval::<()>(RAISE).await));
+        assert_e42(&failure(isle.call::<_, ()>("raise", ()).await));
+        assert_e42(&failure(isle.coroutine_call::<_, ()>("raise", ()).await));
+        assert_e42(&failure(isle.spawn_coroutine_eval::<()>(RAISE).await));
 
         let sync = Isle::spawn(|_| Ok(())).unwrap();
-        assert_e42(&failure(sync.eval(RAISE)));
+        assert_e42(&failure(sync.eval::<()>(RAISE)));
         sync.shutdown().unwrap();
 
         driver.shutdown().await.unwrap();
@@ -521,14 +521,19 @@ mod runtime_paths {
     #[tokio::test]
     async fn async_isle_not_found_and_old_sentinel() {
         let (isle, driver) = AsyncIsle::spawn(|_| Ok(())).await.unwrap();
-        assert!(matches!(isle.call("nope", &[]).await, Err(IsleError::NotFound(n)) if n == "nope"));
+        assert!(
+            matches!(isle.call::<_, ()>("nope", ()).await, Err(IsleError::NotFound(n)) if n == "nope")
+        );
         assert!(matches!(
-            isle.coroutine_call("nope", &[]).await,
+            isle.coroutine_call::<_, ()>("nope", ()).await,
             Err(IsleError::NotFound(n)) if n == "nope"
         ));
-        let f = failure(isle.coroutine_eval("error('__isle_cancelled__')").await);
+        let f = failure(
+            isle.coroutine_eval::<()>("error('__isle_cancelled__')")
+                .await,
+        );
         assert!(f.message.ends_with("__isle_cancelled__"));
-        let f = failure(isle.eval("error('__isle_cancelled__')").await);
+        let f = failure(isle.eval::<()>("error('__isle_cancelled__')").await);
         assert!(f.message.ends_with("__isle_cancelled__"));
         driver.shutdown().await.unwrap();
     }
@@ -560,9 +565,9 @@ mod runtime_paths {
         let (isle, driver) = AsyncIsle::spawn(|lua| lua.globals().set("xpcall", mlua::Value::Nil))
             .await
             .unwrap();
-        assert_eq!(isle.coroutine_eval("return 1 + 1").await.unwrap(), "2");
-        assert_eq!(isle.eval("return 2 + 2").await.unwrap(), "4");
-        let f = failure(isle.coroutine_eval("error({ code = 1 })").await);
+        assert_eq!(isle.coroutine_eval::<i64>("return 1 + 1").await.unwrap(), 2);
+        assert_eq!(isle.eval::<i64>("return 2 + 2").await.unwrap(), 4);
+        let f = failure(isle.coroutine_eval::<()>("error({ code = 1 })").await);
         assert_eq!(f.kind, LuaErrorKind::Runtime);
         assert!(f.traceback.is_some());
         driver.shutdown().await.unwrap();
@@ -571,8 +576,11 @@ mod runtime_paths {
     #[tokio::test]
     async fn coroutine_eval_survives_whitelisted_globals() {
         let (isle, driver) = AsyncIsle::spawn(sandbox).await.unwrap();
-        assert_eq!(isle.coroutine_eval("return 40 + 2").await.unwrap(), "42");
-        let f = failure(isle.coroutine_eval("error('x')").await);
+        assert_eq!(
+            isle.coroutine_eval::<i64>("return 40 + 2").await.unwrap(),
+            42
+        );
+        let f = failure(isle.coroutine_eval::<()>("error('x')").await);
         assert_eq!(f.message, "coroutine_eval:1: x");
         assert!(f.traceback.is_some(), "the message handler did not run");
         driver.shutdown().await.unwrap();
@@ -598,11 +606,11 @@ mod runtime_paths {
         let (isle, driver) = AsyncIsle::spawn(|lua| lua.set_memory_limit(1 << 20).map(drop))
             .await
             .unwrap();
-        let f = failure(isle.coroutine_eval(ALLOC_LOOP).await);
+        let f = failure(isle.coroutine_eval::<()>(ALLOC_LOOP).await);
         assert_eq!(f.kind, LuaErrorKind::Memory, "got: {f:?}");
-        let f = failure(isle.eval(ALLOC_LOOP).await);
+        let f = failure(isle.eval::<()>(ALLOC_LOOP).await);
         assert_eq!(f.kind, LuaErrorKind::Memory, "got: {f:?}");
-        assert_eq!(isle.coroutine_eval("return 1").await.unwrap(), "1");
+        assert_eq!(isle.coroutine_eval::<i64>("return 1").await.unwrap(), 1);
         driver.shutdown().await.unwrap();
     }
 
@@ -611,10 +619,10 @@ mod runtime_paths {
         let (isle, driver) = AsyncIsle::spawn(|lua| lua.set_memory_limit(1 << 20).map(drop))
             .await
             .unwrap();
-        let f = failure(isle.coroutine_eval(CLOSE_OOM).await);
+        let f = failure(isle.coroutine_eval::<()>(CLOSE_OOM).await);
         assert_eq!(f.kind, LuaErrorKind::Memory, "got: {f:?}");
         assert_eq!(f.traceback, None);
-        assert_eq!(isle.coroutine_eval("return 1").await.unwrap(), "1");
+        assert_eq!(isle.coroutine_eval::<i64>("return 1").await.unwrap(), 1);
         driver.shutdown().await.unwrap();
     }
 
@@ -637,7 +645,7 @@ error('A')";
         let b = "sleep(10)
 sleep(0)
 error('B')";
-        let (ra, rb) = tokio::join!(isle.coroutine_eval(a), isle.coroutine_eval(b));
+        let (ra, rb) = tokio::join!(isle.coroutine_eval::<()>(a), isle.coroutine_eval::<()>(b));
         let (fa, fb) = (failure(ra), failure(rb));
         assert_eq!(fa.message, "coroutine_eval:2: A");
         assert_eq!(fb.message, "coroutine_eval:3: B");

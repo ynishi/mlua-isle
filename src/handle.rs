@@ -90,99 +90,136 @@ impl Isle {
         })
     }
 
-    /// Evaluate a Lua chunk (blocking).
+    /// Evaluate a Lua chunk (blocking) and convert its return values
+    /// to `T`.  Equivalent to `spawn_eval(code).wait()`.
     ///
-    /// Returns the result as a string.  Equivalent to
-    /// `spawn_eval(code).wait()`.
+    /// The conversion ([`FromLuaMulti`](mlua::FromLuaMulti)) runs on the
+    /// Lua thread, so any `T: FromLuaMulti + Send + 'static` works: a
+    /// single value (`String`, `i64`, `f64`, `bool`,
+    /// [`BString`](mlua::BString) for the raw bytes of a Lua string), `()`
+    /// to ignore the result, `Option<T>` for a result that may be `nil`,
+    /// or a tuple for several return values.  Values tied to the VM
+    /// (`Table`, `Function`, `Value`, `MultiValue`) are not `Send`
+    /// without mlua's `send` feature and then do not compile here; use
+    /// [`exec`](Self::exec) to convert them on the Lua thread, or ask for
+    /// a [`RegistryKey`](mlua::RegistryKey), which is `Send`, and read
+    /// the value back in a later `exec`.
     ///
-    /// A Lua error is [`IsleError::Lua`].  When the request's token was
-    /// cancelled, the result is [`IsleError::Cancelled`] even if the Lua
-    /// code caught the cancel and raised an error of its own (the same
-    /// rule as coroutine requests and `Vm::run`); this holds for `call`
-    /// too.
-    pub fn eval(&self, code: &str) -> Result<String, IsleError> {
+    /// ```rust
+    /// # use mlua_isle::Isle;
+    /// let isle = Isle::spawn(|_| Ok(())).unwrap();
+    /// let n: i64 = isle.eval("return 1 + 1").unwrap();
+    /// assert_eq!(n, 2);
+    /// let (a, b) = isle.eval::<(i64, String)>("return 1, 'x'").unwrap();
+    /// assert_eq!((a, b.as_str()), (1, "x"));
+    /// assert_eq!(isle.eval::<Option<String>>("return nil").unwrap(), None);
+    /// # isle.shutdown().unwrap();
+    /// ```
+    ///
+    /// A Lua error is [`IsleError::Lua`], and so is a return value that
+    /// does not convert to `T` (kind
+    /// [`Conversion`](crate::LuaErrorKind::Conversion)).  A `FromLua` of
+    /// your own that fails with an error raised by Lua code it runs (a
+    /// `__index` metamethod, say) is `Lua` with that error's kind, not
+    /// `Conversion`; the conversion runs under the request's token, so
+    /// a cancel while it runs Lua code is `Cancelled`.  When the
+    /// request's token was cancelled, the result is
+    /// [`IsleError::Cancelled`] even if the Lua code caught the cancel
+    /// and raised an error of its own (the same rule as coroutine
+    /// requests and `Vm::run`); this holds for `call` too.
+    pub fn eval<T>(&self, code: &str) -> Result<T, IsleError>
+    where
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
         self.spawn_eval(code).wait()
     }
 
     /// Evaluate a Lua chunk, returning a cancellable [`Task`].
-    pub fn spawn_eval(&self, code: &str) -> Task {
-        let cancel = CancelToken::new();
-        let (resp_tx, resp_rx) = mpsc::channel();
-
-        let req = Request::Eval {
-            code: code.to_string(),
-            cancel: cancel.clone(),
-            tx: resp_tx,
-        };
-
-        if self.tx.send(req).is_err() {
-            // Channel closed — return a task that immediately errors
-            let (err_tx, err_rx) = mpsc::channel();
-            let _ = err_tx.send(Err(IsleError::Shutdown));
-            return Task::new(err_rx, cancel);
-        }
-
-        Task::new(resp_rx, cancel)
+    pub fn spawn_eval<T>(&self, code: &str) -> Task<T>
+    where
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        let code = code.to_string();
+        self.submit(move |lua, cancel| thread::execute_eval(lua, &code, cancel))
     }
 
-    /// Call a named global Lua function with string arguments (blocking).
-    pub fn call(&self, func: &str, args: &[&str]) -> Result<String, IsleError> {
+    /// Call a named global Lua function (blocking) and convert its
+    /// return values to `T`.
+    ///
+    /// `args` is converted on the Lua thread
+    /// ([`IntoLuaMulti`](mlua::IntoLuaMulti)): `()` for no arguments, a
+    /// value, a tuple such as `(1, true, "x")`, or a
+    /// [`Variadic`](mlua::Variadic) for a number of arguments known only
+    /// at run time (a `Vec` is one argument, a table).  The result
+    /// follows the rules of [`eval`](Self::eval).  A global that is not
+    /// a function is [`IsleError::NotFound`].
+    pub fn call<A, T>(&self, func: &str, args: A) -> Result<T, IsleError>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
         self.spawn_call(func, args).wait()
     }
 
     /// Call a named global Lua function, returning a cancellable [`Task`].
-    pub fn spawn_call(&self, func: &str, args: &[&str]) -> Task {
-        let cancel = CancelToken::new();
-        let (resp_tx, resp_rx) = mpsc::channel();
-
-        let req = Request::Call {
-            func: func.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-            cancel: cancel.clone(),
-            tx: resp_tx,
-        };
-
-        if self.tx.send(req).is_err() {
-            let (err_tx, err_rx) = mpsc::channel();
-            let _ = err_tx.send(Err(IsleError::Shutdown));
-            return Task::new(err_rx, cancel);
-        }
-
-        Task::new(resp_rx, cancel)
+    pub fn spawn_call<A, T>(&self, func: &str, args: A) -> Task<T>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        let func = func.to_string();
+        self.submit(move |lua, cancel| thread::execute_call(lua, &func, args, cancel))
     }
 
     /// Execute an arbitrary closure on the Lua thread (blocking).
     ///
-    /// The closure receives `&Lua` and can perform any operation.
-    /// This is the escape hatch for complex interactions that don't
-    /// fit into `eval` or `call`.
+    /// The closure receives `&Lua` and can perform any operation; its
+    /// `T` crosses back as is (no conversion).  This is the escape
+    /// hatch for complex interactions that don't fit into `eval` or
+    /// `call`, and the place to turn a value tied to the VM (a `Table`)
+    /// into a `Send` one.  `?` works on `mlua::Result` inside the
+    /// closure (`IsleError: From<mlua::Error>`).
     ///
     /// **Note:** The cancel hook only fires during Lua instruction
     /// execution.  If the closure blocks in Rust code (e.g. HTTP
     /// calls, file I/O), cancellation will not take effect until
     /// control returns to the Lua VM.
-    pub fn exec<F>(&self, f: F) -> Result<String, IsleError>
+    pub fn exec<F, T>(&self, f: F) -> Result<T, IsleError>
     where
-        F: FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send + 'static,
+        F: FnOnce(&mlua::Lua) -> Result<T, IsleError> + Send + 'static,
+        T: Send + 'static,
     {
         self.spawn_exec(f).wait()
     }
 
     /// Execute a closure on the Lua thread, returning a cancellable [`Task`].
-    pub fn spawn_exec<F>(&self, f: F) -> Task
+    pub fn spawn_exec<F, T>(&self, f: F) -> Task<T>
     where
-        F: FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send + 'static,
+        F: FnOnce(&mlua::Lua) -> Result<T, IsleError> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit(move |lua, cancel| thread::execute_exec(lua, f, cancel))
+    }
+
+    /// Send a job that runs `run` on the Lua thread and sends its
+    /// result back through the returned task's channel.
+    fn submit<T, R>(&self, run: R) -> Task<T>
+    where
+        T: Send + 'static,
+        R: FnOnce(&mlua::Lua, &CancelToken) -> Result<T, IsleError> + Send + 'static,
     {
         let cancel = CancelToken::new();
         let (resp_tx, resp_rx) = mpsc::channel();
 
-        let req = Request::Exec {
-            f: Box::new(f),
+        let req = Request::Run {
+            job: Box::new(move |lua, cancel| {
+                let _ = resp_tx.send(run(lua, cancel));
+            }),
             cancel: cancel.clone(),
-            tx: resp_tx,
         };
 
         if self.tx.send(req).is_err() {
+            // Channel closed — return a task that immediately errors
             let (err_tx, err_rx) = mpsc::channel();
             let _ = err_tx.send(Err(IsleError::Shutdown));
             return Task::new(err_rx, cancel);

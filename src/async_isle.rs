@@ -141,52 +141,8 @@ use crate::error::{panic_message, IsleError, LuaErrorKind, LuaFailure};
 use crate::hook::CancelToken;
 use crate::runtime::Config;
 use crate::thread;
+use crate::Request;
 use std::thread::JoinHandle;
-
-/// Closure type for async exec requests.
-type AsyncExecFn = Box<dyn FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send>;
-
-/// Response sender (oneshot).
-type AsyncResultTx = tokio::sync::oneshot::Sender<Result<String, IsleError>>;
-
-/// Request sent from async callers to the Lua thread.
-enum AsyncRequest {
-    Eval {
-        code: String,
-        cancel: CancelToken,
-        tx: AsyncResultTx,
-    },
-    Call {
-        func: String,
-        args: Vec<String>,
-        cancel: CancelToken,
-        tx: AsyncResultTx,
-    },
-    Exec {
-        f: AsyncExecFn,
-        cancel: CancelToken,
-        tx: AsyncResultTx,
-    },
-    /// Evaluate Lua code as a coroutine (cooperative, non-blocking).
-    ///
-    /// Unlike `Eval`, this runs the code in a Lua coroutine via
-    /// `call_async()` + `spawn_local`.  When the coroutine yields
-    /// (e.g. awaiting an async Rust function registered via
-    /// `create_async_function`), other coroutines can make progress.
-    CoroutineEval {
-        code: String,
-        cancel: CancelToken,
-        tx: AsyncResultTx,
-    },
-    /// Call a named function as a coroutine (cooperative, non-blocking).
-    CoroutineCall {
-        func: String,
-        args: Vec<String>,
-        cancel: CancelToken,
-        tx: AsyncResultTx,
-    },
-    Shutdown,
-}
 
 /// Default capacity for the request channel.
 ///
@@ -216,7 +172,7 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 ///    terminate the Lua thread.
 #[derive(Clone)]
 pub struct AsyncIsle {
-    tx: tokio::sync::mpsc::Sender<AsyncRequest>,
+    tx: tokio::sync::mpsc::Sender<Request>,
 }
 
 /// Lifecycle driver for the async Lua VM thread.
@@ -257,7 +213,7 @@ pub struct AsyncIsle {
 /// [tokio bridging guide]: https://tokio.rs/tokio/topics/bridging
 #[must_use = "call .shutdown().await for clean thread join; dropping without shutdown detaches the thread"]
 pub struct AsyncIsleDriver {
-    tx: tokio::sync::mpsc::Sender<AsyncRequest>,
+    tx: tokio::sync::mpsc::Sender<Request>,
     done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     join: Option<JoinHandle<()>>,
 }
@@ -425,7 +381,7 @@ impl AsyncIsle {
     where
         F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
     {
-        let (tx, rx) = tokio::sync::mpsc::channel::<AsyncRequest>(channel_capacity);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Request>(channel_capacity);
         let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<(), IsleError>>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -501,7 +457,8 @@ impl AsyncIsle {
         Ok((handle, driver))
     }
 
-    /// Evaluate a Lua chunk (sync execution on the Lua thread).
+    /// Evaluate a Lua chunk (sync execution on the Lua thread) and
+    /// convert its return values to `T`.
     ///
     /// The Lua VM is exclusively occupied during execution.  The
     /// **caller's** tokio task is not blocked (it awaits a oneshot
@@ -511,13 +468,51 @@ impl AsyncIsle {
     /// For cooperative execution that interleaves with other
     /// coroutines, use [`coroutine_eval`](Self::coroutine_eval).
     ///
-    /// When the request's token was cancelled, the result is
+    /// The conversion ([`FromLuaMulti`](mlua::FromLuaMulti)) runs on the
+    /// Lua thread, so any `T: FromLuaMulti + Send + 'static` works: a
+    /// single value (`String`, `i64`, `f64`, `bool`,
+    /// [`BString`](mlua::BString) for the raw bytes of a Lua string), `()`
+    /// to ignore the result, `Option<T>` for a result that may be `nil`,
+    /// or a tuple for several return values.  Values tied to the VM
+    /// (`Table`, `Function`, `Value`, `MultiValue`) are not `Send`
+    /// without mlua's `send` feature and then do not compile here; use
+    /// [`exec`](Self::exec) to convert them on the Lua thread, or ask for
+    /// a [`RegistryKey`](mlua::RegistryKey), which is `Send`, and read
+    /// the value back in a later `exec`.
+    ///
+    /// ```rust
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use mlua_isle::AsyncIsle;
+    ///
+    /// let (isle, driver) = AsyncIsle::spawn(|_| Ok(())).await?;
+    /// let n: i64 = isle.eval("return 1 + 1").await?;
+    /// assert_eq!(n, 2);
+    /// let (a, ok) = isle.eval::<(i64, bool)>("return 1, true").await?;
+    /// assert_eq!((a, ok), (1, true));
+    /// assert_eq!(isle.eval::<Option<String>>("return nil").await?, None);
+    /// driver.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A Lua error is [`IsleError::Lua`], and so is a return value that
+    /// does not convert to `T` (kind
+    /// [`Conversion`](crate::LuaErrorKind::Conversion)).  A `FromLua` of
+    /// your own that fails with an error raised by Lua code it runs (a
+    /// `__index` metamethod, say) is `Lua` with that error's kind, not
+    /// `Conversion`; the conversion runs under the request's token, so
+    /// a cancel while it runs Lua code is `Cancelled`.  When the
+    /// request's token was cancelled, the result is
     /// [`IsleError::Cancelled`] even if the Lua code caught the cancel
     /// and raised an error of its own (the same rule as coroutine
     /// requests); this holds for `call` too.
     ///
     /// Equivalent to `spawn_eval(code).await`.
-    pub async fn eval(&self, code: &str) -> Result<String, IsleError> {
+    pub async fn eval<T>(&self, code: &str) -> Result<T, IsleError>
+    where
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
         self.spawn_eval(code).await
     }
 
@@ -525,24 +520,24 @@ impl AsyncIsle {
     ///
     /// The returned task implements [`Future`](std::future::Future) —
     /// `.await` it to get the result.
-    pub fn spawn_eval(&self, code: &str) -> AsyncTask {
-        let cancel = CancelToken::new();
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-
-        let req = AsyncRequest::Eval {
-            code: code.to_string(),
-            cancel: cancel.clone(),
-            tx: resp_tx,
-        };
-
-        match self.tx.try_send(req) {
-            Ok(()) => AsyncTask::new(resp_rx, cancel),
-            Err(e) => make_error_task(try_send_to_isle_error(e), cancel),
-        }
+    pub fn spawn_eval<T>(&self, code: &str) -> AsyncTask<T>
+    where
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        let code = code.to_string();
+        self.submit_sync(move |lua, cancel| thread::execute_eval(lua, &code, cancel))
     }
 
-    /// Call a named global Lua function with string arguments
-    /// (sync execution on the Lua thread).
+    /// Call a named global Lua function (sync execution on the Lua
+    /// thread) and convert its return values to `T`.
+    ///
+    /// `args` is converted on the Lua thread
+    /// ([`IntoLuaMulti`](mlua::IntoLuaMulti)): `()` for no arguments, a
+    /// value, a tuple such as `(1, true, "x")`, or a
+    /// [`Variadic`](mlua::Variadic) for a number of arguments known only
+    /// at run time (a `Vec` is one argument, a table).  The result
+    /// follows the rules of [`eval`](Self::eval).  A global that is not
+    /// a function is [`IsleError::NotFound`].
     ///
     /// Same threading behaviour as [`eval`](Self::eval) — the Lua VM
     /// is exclusively occupied; the caller is not blocked.  For
@@ -550,63 +545,55 @@ impl AsyncIsle {
     /// [`coroutine_call`](Self::coroutine_call).
     ///
     /// Equivalent to `spawn_call(func, args).await`.
-    pub async fn call(&self, func: &str, args: &[&str]) -> Result<String, IsleError> {
+    pub async fn call<A, T>(&self, func: &str, args: A) -> Result<T, IsleError>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
         self.spawn_call(func, args).await
     }
 
     /// Call a named global Lua function, returning a cancellable [`AsyncTask`].
-    pub fn spawn_call(&self, func: &str, args: &[&str]) -> AsyncTask {
-        let cancel = CancelToken::new();
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-
-        let req = AsyncRequest::Call {
-            func: func.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-            cancel: cancel.clone(),
-            tx: resp_tx,
-        };
-
-        match self.tx.try_send(req) {
-            Ok(()) => AsyncTask::new(resp_rx, cancel),
-            Err(e) => make_error_task(try_send_to_isle_error(e), cancel),
-        }
+    pub fn spawn_call<A, T>(&self, func: &str, args: A) -> AsyncTask<T>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        let func = func.to_string();
+        self.submit_sync(move |lua, cancel| thread::execute_call(lua, &func, args, cancel))
     }
 
     /// Execute an arbitrary closure on the Lua thread
     /// (sync execution).
     ///
+    /// The closure's `T` crosses back as is (no conversion); this is
+    /// the place to turn a value tied to the VM (a `Table`) into a
+    /// `Send` one.  `?` works on `mlua::Result` inside the closure
+    /// (`IsleError: From<mlua::Error>`).
+    ///
     /// Same threading behaviour as [`eval`](Self::eval) — the Lua VM
     /// is exclusively occupied; the caller is not blocked.
     ///
     /// Equivalent to `spawn_exec(f).await`.
-    pub async fn exec<F>(&self, f: F) -> Result<String, IsleError>
+    pub async fn exec<F, T>(&self, f: F) -> Result<T, IsleError>
     where
-        F: FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send + 'static,
+        F: FnOnce(&mlua::Lua) -> Result<T, IsleError> + Send + 'static,
+        T: Send + 'static,
     {
         self.spawn_exec(f).await
     }
 
     /// Execute a closure on the Lua thread, returning a cancellable [`AsyncTask`].
-    pub fn spawn_exec<F>(&self, f: F) -> AsyncTask
+    pub fn spawn_exec<F, T>(&self, f: F) -> AsyncTask<T>
     where
-        F: FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send + 'static,
+        F: FnOnce(&mlua::Lua) -> Result<T, IsleError> + Send + 'static,
+        T: Send + 'static,
     {
-        let cancel = CancelToken::new();
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-
-        let req = AsyncRequest::Exec {
-            f: Box::new(f),
-            cancel: cancel.clone(),
-            tx: resp_tx,
-        };
-
-        match self.tx.try_send(req) {
-            Ok(()) => AsyncTask::new(resp_rx, cancel),
-            Err(e) => make_error_task(try_send_to_isle_error(e), cancel),
-        }
+        self.submit_sync(move |lua, cancel| thread::execute_exec(lua, f, cancel))
     }
 
-    /// Evaluate Lua code as a cooperative coroutine.
+    /// Evaluate Lua code as a cooperative coroutine and convert its
+    /// return values to `T` (the rules of [`eval`](Self::eval)).
     ///
     /// Unlike [`eval`](Self::eval), this runs the code inside a Lua
     /// coroutine via [`Function::call_async`](mlua::Function::call_async).
@@ -628,46 +615,96 @@ impl AsyncIsle {
     /// [lua-coro]: https://www.lua.org/pil/9.html
     ///
     /// Equivalent to `spawn_coroutine_eval(code).await`.
-    pub async fn coroutine_eval(&self, code: &str) -> Result<String, IsleError> {
+    pub async fn coroutine_eval<T>(&self, code: &str) -> Result<T, IsleError>
+    where
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
         self.spawn_coroutine_eval(code).await
     }
 
     /// Evaluate Lua code as a cooperative coroutine, returning a cancellable [`AsyncTask`].
-    pub fn spawn_coroutine_eval(&self, code: &str) -> AsyncTask {
-        let cancel = CancelToken::new();
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-
-        let req = AsyncRequest::CoroutineEval {
-            code: code.to_string(),
-            cancel: cancel.clone(),
-            tx: resp_tx,
-        };
-
-        match self.tx.try_send(req) {
-            Ok(()) => AsyncTask::new(resp_rx, cancel),
-            Err(e) => make_error_task(try_send_to_isle_error(e), cancel),
-        }
+    pub fn spawn_coroutine_eval<T>(&self, code: &str) -> AsyncTask<T>
+    where
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        let code = code.to_string();
+        self.submit_coroutine(move |lua, cancel| async move {
+            execute_coroutine_eval(&lua, &code, &cancel).await
+        })
     }
 
-    /// Call a named function as a cooperative coroutine.
+    /// Call a named function as a cooperative coroutine and convert its
+    /// return values to `T`.
     ///
     /// Like [`coroutine_eval`](Self::coroutine_eval) but for calling
-    /// a named global function.  Same yield-point requirements apply
-    /// — see [`coroutine_eval`](Self::coroutine_eval) for details.
-    pub async fn coroutine_call(&self, func: &str, args: &[&str]) -> Result<String, IsleError> {
+    /// a named global function; `args` as in [`call`](Self::call).
+    /// Same yield-point requirements apply — see
+    /// [`coroutine_eval`](Self::coroutine_eval) for details.
+    pub async fn coroutine_call<A, T>(&self, func: &str, args: A) -> Result<T, IsleError>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
         self.spawn_coroutine_call(func, args).await
     }
 
     /// Call a named function as a cooperative coroutine, returning a cancellable [`AsyncTask`].
-    pub fn spawn_coroutine_call(&self, func: &str, args: &[&str]) -> AsyncTask {
+    pub fn spawn_coroutine_call<A, T>(&self, func: &str, args: A) -> AsyncTask<T>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        let func = func.to_string();
+        self.submit_coroutine(move |lua, cancel| async move {
+            execute_coroutine_call(&lua, &func, args, &cancel).await
+        })
+    }
+
+    /// Send a job that runs `run` inline on the Lua thread (a sync
+    /// request) and sends its result through the returned task.
+    fn submit_sync<T, R>(&self, run: R) -> AsyncTask<T>
+    where
+        T: Send + 'static,
+        R: FnOnce(&mlua::Lua, &CancelToken) -> Result<T, IsleError> + Send + 'static,
+    {
+        self.submit(move |tx| {
+            Box::new(move |lua, cancel| {
+                let _ = tx.send(run(lua, cancel));
+            })
+        })
+    }
+
+    /// Send a job that `spawn_local`s the future `run` builds (a
+    /// coroutine request) and sends its result through the returned
+    /// task.  The future runs on the Lua thread, so it need not be
+    /// `Send`; only `run` and `T` cross.
+    fn submit_coroutine<T, R, Fut>(&self, run: R) -> AsyncTask<T>
+    where
+        T: Send + 'static,
+        R: FnOnce(mlua::Lua, CancelToken) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, IsleError>> + 'static,
+    {
+        self.submit(move |tx| {
+            Box::new(move |lua, cancel| {
+                let fut = run(lua.clone(), cancel.clone());
+                tokio::task::spawn_local(async move {
+                    let _ = tx.send(fut.await);
+                });
+            })
+        })
+    }
+
+    /// Enqueue the job `make_job` builds around the task's sender.
+    fn submit<T>(
+        &self,
+        make_job: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, IsleError>>) -> crate::Job,
+    ) -> AsyncTask<T> {
         let cancel = CancelToken::new();
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 
-        let req = AsyncRequest::CoroutineCall {
-            func: func.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
+        let req = Request::Run {
+            job: make_job(resp_tx),
             cancel: cancel.clone(),
-            tx: resp_tx,
         };
 
         match self.tx.try_send(req) {
@@ -729,7 +766,7 @@ impl AsyncIsleDriver {
     pub async fn shutdown(mut self) -> Result<(), IsleError> {
         // Use .send().await to respect backpressure instead of try_send,
         // which would silently drop the shutdown signal when the channel is full.
-        let _ = self.tx.send(AsyncRequest::Shutdown).await;
+        let _ = self.tx.send(Request::Shutdown).await;
 
         // Await the Lua thread's completion signal (pure async).  An
         // error means the thread dropped the sender without sending: it
@@ -771,7 +808,7 @@ impl AsyncIsleDriver {
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// Create an [`AsyncTask`] that resolves to an error immediately.
-fn make_error_task(err: IsleError, cancel: CancelToken) -> AsyncTask {
+fn make_error_task<T>(err: IsleError, cancel: CancelToken) -> AsyncTask<T> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = tx.send(Err(err));
     AsyncTask::new(rx, cancel)
@@ -792,9 +829,9 @@ fn try_send_to_isle_error<T>(err: tokio::sync::mpsc::error::TrySendError<T>) -> 
 /// Lua event loop for async requests (runs on the dedicated Lua thread).
 ///
 /// Uses a [`tokio::task::LocalSet`] to enable cooperative coroutine
-/// execution.  Sync requests (`Eval`/`Call`/`Exec`) run inline and
-/// block the event loop (same as before).  Coroutine requests
-/// (`CoroutineEval`/`CoroutineCall`) are `spawn_local`'d and can
+/// execution.  Sync requests (`eval`/`call`/`exec`) run inline and
+/// block the event loop.  Coroutine requests
+/// (`coroutine_eval`/`coroutine_call`) are `spawn_local`'d and can
 /// interleave — when one yields (e.g. awaiting an async Rust function),
 /// others make progress.
 ///
@@ -815,7 +852,7 @@ fn try_send_to_isle_error<T>(err: tokio::sync::mpsc::error::TrySendError<T>) -> 
 /// [`Future`]: std::future::Future
 fn run_async_loop(
     lua: mlua::Lua,
-    mut rx: tokio::sync::mpsc::Receiver<AsyncRequest>,
+    mut rx: tokio::sync::mpsc::Receiver<Request>,
     rt: tokio::runtime::Runtime,
 ) {
     let local = tokio::task::LocalSet::new();
@@ -826,47 +863,11 @@ fn run_async_loop(
     local.spawn_local(async move {
         while let Some(req) = rx.recv().await {
             match req {
-                // ── Sync requests (backward-compatible, blocks event loop) ──
-                AsyncRequest::Eval { code, cancel, tx } => {
-                    let result = thread::execute_eval(&lua, &code, &cancel);
-                    let _ = tx.send(result);
-                }
-                AsyncRequest::Call {
-                    func,
-                    args,
-                    cancel,
-                    tx,
-                } => {
-                    let result = thread::execute_call(&lua, &func, &args, &cancel);
-                    let _ = tx.send(result);
-                }
-                AsyncRequest::Exec { f, cancel, tx } => {
-                    let result = thread::execute_exec(&lua, f, &cancel);
-                    let _ = tx.send(result);
-                }
-
-                // ── Coroutine requests (cooperative, non-blocking) ──
-                AsyncRequest::CoroutineEval { code, cancel, tx } => {
-                    let lua = lua.clone();
-                    tokio::task::spawn_local(async move {
-                        let result = execute_coroutine_eval(&lua, &code, &cancel).await;
-                        let _ = tx.send(result);
-                    });
-                }
-                AsyncRequest::CoroutineCall {
-                    func,
-                    args,
-                    cancel,
-                    tx,
-                } => {
-                    let lua = lua.clone();
-                    tokio::task::spawn_local(async move {
-                        let result = execute_coroutine_call(&lua, &func, &args, &cancel).await;
-                        let _ = tx.send(result);
-                    });
-                }
-
-                AsyncRequest::Shutdown => break,
+                // A sync job runs inline (the VM is occupied until it
+                // returns); a coroutine job spawn_locals its future and
+                // returns at once.
+                Request::Run { job, cancel } => job(&lua, &cancel),
+                Request::Shutdown => break,
             }
 
             // Yield to let spawn_local'd coroutines make progress
@@ -908,31 +909,44 @@ fn vm(lua: &mlua::Lua) -> Result<crate::runtime::Vm, IsleError> {
 ///   sockets, etc.) and pending to-be-closed variables are closed.  A
 ///   coroutine built with [`Thread::into_async`](mlua::Thread::into_async)
 ///   would instead keep the future alive until the next Lua GC cycle.
-async fn execute_coroutine_eval(
+async fn execute_coroutine_eval<T: mlua::FromLuaMulti>(
     lua: &mlua::Lua,
     code: &str,
     cancel: &CancelToken,
-) -> Result<String, IsleError> {
+) -> Result<T, IsleError> {
     let func = lua
         .load(code)
         .set_name("=coroutine_eval")
         .into_function()
         .map_err(IsleError::from)?;
     let values = vm(lua)?.run(cancel, func, ()).await?;
-    thread::lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
+    convert(lua, values, cancel)
 }
 
 /// Call a named function as a coroutine via [`Function::call_async`](mlua::Function::call_async).
 ///
 /// See [`execute_coroutine_eval`] for cancellation semantics.
-async fn execute_coroutine_call(
+async fn execute_coroutine_call<A: mlua::IntoLuaMulti, T: mlua::FromLuaMulti>(
     lua: &mlua::Lua,
     func_name: &str,
-    args: &[String],
+    args: A,
     cancel: &CancelToken,
-) -> Result<String, IsleError> {
+) -> Result<T, IsleError> {
     let func = thread::global_function(lua, func_name)?;
-    let multi = thread::string_args(lua, args)?;
+    let multi = args.into_lua_multi(lua)?;
     let values = vm(lua)?.run(cancel, func, multi).await?;
-    thread::lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
+    convert(lua, values, cancel)
+}
+
+/// Convert a coroutine request's return values to `T` under the
+/// request's token: a `FromLua` of the caller's that runs Lua code (a
+/// metamethod, a loop) stays cancellable after `Vm::run` has resolved.
+/// There is no `.await` in between, so no other coroutine interleaves.
+fn convert<T: mlua::FromLuaMulti>(
+    lua: &mlua::Lua,
+    values: mlua::MultiValue,
+    cancel: &CancelToken,
+) -> Result<T, IsleError> {
+    let _enter = crate::hook::EnterGuard::new(cancel);
+    Ok(T::from_lua_multi(values, lua)?)
 }

@@ -164,14 +164,14 @@ impl Registry {
 ///     lua.globals().set("task", task)
 /// })
 /// .await?;
-/// let r = isle
+/// let r: i64 = isle
 ///     .coroutine_eval(
 ///         "local h = task.spawn(function(a, b) return a + b end, 1, 2)
 ///          local ok, sum = h:join()
 ///          return sum",
 ///     )
 ///     .await?;
-/// assert_eq!(r, "3");
+/// assert_eq!(r, 3);
 /// driver.shutdown().await?;
 /// # Ok(())
 /// # }

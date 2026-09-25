@@ -96,33 +96,19 @@ pub use async_pool::{AsyncIslePool, AsyncPooledIsle};
 #[cfg(feature = "tokio")]
 pub use async_task::AsyncTask;
 
-/// Type alias for exec closures to keep the `Request` enum readable.
-pub(crate) type ExecFn = Box<dyn FnOnce(&mlua::Lua) -> Result<String, IsleError> + Send>;
+/// The work of one request, run on the VM thread.
+///
+/// A job owns everything its request needs: the code or the arguments,
+/// and the typed sender its result goes back through.  It converts the
+/// result on the VM thread (`FromLuaMulti`, or the `exec` closure's own
+/// `T`) and sends a `Send` value, so the request type needs no type
+/// parameter.  A coroutine job `spawn_local`s its future and returns.
+pub(crate) type Job = Box<dyn FnOnce(&mlua::Lua, &CancelToken) + Send>;
 
-/// Channel sender for results.
-pub(crate) type ResultTx = std::sync::mpsc::Sender<Result<String, IsleError>>;
-
-/// Request sent from caller to the Lua thread.
+/// Request sent from a handle ([`Isle`], `AsyncIsle`) to the VM thread.
 pub(crate) enum Request {
-    /// Evaluate a Lua chunk and return the result as a string.
-    Eval {
-        code: String,
-        cancel: CancelToken,
-        tx: ResultTx,
-    },
-    /// Call a named global function with string arguments.
-    Call {
-        func: String,
-        args: Vec<String>,
-        cancel: CancelToken,
-        tx: ResultTx,
-    },
-    /// Execute an arbitrary closure on the Lua thread.
-    Exec {
-        f: ExecFn,
-        cancel: CancelToken,
-        tx: ResultTx,
-    },
+    /// Run a job under the request's cancel token.
+    Run { job: Job, cancel: CancelToken },
     /// Graceful shutdown.
     Shutdown,
 }

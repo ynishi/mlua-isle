@@ -57,8 +57,8 @@ async fn cold_checkout_eval() {
     .unwrap();
 
     let isle = pool.checkout().await.unwrap();
-    let result = isle.eval("return base + 5").await.unwrap();
-    assert_eq!(result, "15");
+    let result: i64 = isle.eval("return base + 5").await.unwrap();
+    assert_eq!(result, 15);
     drop(isle);
 
     pool.shutdown().await;
@@ -79,7 +79,7 @@ async fn cold_does_not_preserve_state() {
 
     {
         let isle = pool.checkout().await.unwrap();
-        isle.eval("my_global = 42").await.unwrap();
+        isle.eval::<()>("my_global = 42").await.unwrap();
     }
 
     // Give the background driver shutdown task a chance to release the
@@ -93,7 +93,7 @@ async fn cold_does_not_preserve_state() {
 
     {
         let isle = pool.checkout().await.unwrap();
-        let result = isle.eval("return type(my_global)").await.unwrap();
+        let result: String = isle.eval("return type(my_global)").await.unwrap();
         assert_eq!(result, "nil", "cold pool must not preserve state");
     }
 
@@ -119,8 +119,8 @@ async fn warm_checkout_eval() {
     .unwrap();
 
     let isle = pool.checkout().await.unwrap();
-    let result = isle.eval("return base + 5").await.unwrap();
-    assert_eq!(result, "15");
+    let result: i64 = isle.eval("return base + 5").await.unwrap();
+    assert_eq!(result, 15);
     drop(isle);
 
     pool.shutdown().await;
@@ -139,13 +139,13 @@ async fn warm_preserves_state() {
 
     {
         let isle = pool.checkout().await.unwrap();
-        isle.eval("my_global = 42").await.unwrap();
+        isle.eval::<()>("my_global = 42").await.unwrap();
     }
 
     {
         let isle = pool.checkout().await.unwrap();
-        let result = isle.eval("return my_global").await.unwrap();
-        assert_eq!(result, "42", "warm pool must preserve state");
+        let result: i64 = isle.eval("return my_global").await.unwrap();
+        assert_eq!(result, 42, "warm pool must preserve state");
     }
 
     pool.shutdown().await;
@@ -189,7 +189,7 @@ async fn try_checkout_succeeds_when_available() {
     let isle = pool.try_checkout().await.unwrap();
     assert!(isle.is_some(), "should return Some when available");
     let isle = isle.unwrap();
-    assert_eq!(isle.eval("return 1").await.unwrap(), "1");
+    assert_eq!(isle.eval::<i64>("return 1").await.unwrap(), 1);
     drop(isle);
 
     pool.shutdown().await;
@@ -244,7 +244,7 @@ async fn checkout_blocks_then_succeeds_after_return() {
             .await
             .unwrap();
         let elapsed = start.elapsed();
-        let result = isle.eval("return 'waited'").await.unwrap();
+        let result: String = isle.eval("return 'waited'").await.unwrap();
         (result, elapsed)
     });
 
@@ -284,8 +284,8 @@ async fn concurrent_checkouts_all_succeed() {
         handles.push(tokio::spawn(async move {
             let isle = pool.checkout().await.unwrap();
             let code = format!("return {} * 2", i);
-            let result = isle.eval(&code).await.unwrap();
-            assert_eq!(result, (i * 2).to_string());
+            let result: i64 = isle.eval(&code).await.unwrap();
+            assert_eq!(result, i * 2);
         }));
     }
 
@@ -312,8 +312,8 @@ async fn pooled_coroutine_eval() {
     .unwrap();
 
     let isle = pool.checkout().await.unwrap();
-    let result = isle.coroutine_eval("return 1 + 2").await.unwrap();
-    assert_eq!(result, "3");
+    let result: i64 = isle.coroutine_eval("return 1 + 2").await.unwrap();
+    assert_eq!(result, 3);
     drop(isle);
 
     pool.shutdown().await;
@@ -336,7 +336,7 @@ async fn kill_discards_and_next_checkout_gets_fresh_isle() {
 
     {
         let mut isle = pool.checkout().await.unwrap();
-        isle.eval("sentinel = 'old'").await.unwrap();
+        isle.eval::<()>("sentinel = 'old'").await.unwrap();
         isle.kill();
     }
 
@@ -350,7 +350,7 @@ async fn kill_discards_and_next_checkout_gets_fresh_isle() {
 
     {
         let isle = pool.checkout().await.unwrap();
-        let result = isle.eval("return type(sentinel)").await.unwrap();
+        let result: String = isle.eval("return type(sentinel)").await.unwrap();
         assert_eq!(
             result, "nil",
             "kill() must discard the isle; fresh checkout should have clean state"
@@ -401,7 +401,7 @@ async fn shutdown_cleans_up_idle_isles() {
 
     for _ in 0..3 {
         let isle = pool.checkout().await.unwrap();
-        isle.eval("return 1").await.unwrap();
+        isle.eval::<i64>("return 1").await.unwrap();
     }
 
     pool.shutdown().await;
@@ -490,11 +490,11 @@ async fn scenario_vm_isolation_across_concurrent_checkouts() {
     let isle_a = pool.checkout().await.unwrap();
     let isle_b = pool.checkout().await.unwrap();
 
-    isle_a.eval("tag = 'A'").await.unwrap();
-    isle_b.eval("tag = 'B'").await.unwrap();
+    isle_a.eval::<()>("tag = 'A'").await.unwrap();
+    isle_b.eval::<()>("tag = 'B'").await.unwrap();
 
-    assert_eq!(isle_a.eval("return tag").await.unwrap(), "A");
-    assert_eq!(isle_b.eval("return tag").await.unwrap(), "B");
+    assert_eq!(isle_a.eval::<String>("return tag").await.unwrap(), "A");
+    assert_eq!(isle_b.eval::<String>("return tag").await.unwrap(), "B");
 
     drop(isle_a);
     drop(isle_b);
@@ -504,8 +504,8 @@ async fn scenario_vm_isolation_across_concurrent_checkouts() {
     // observed tags into a set.
     let isle1 = pool.checkout().await.unwrap();
     let isle2 = pool.checkout().await.unwrap();
-    let t1 = isle1.eval("return tag").await.unwrap();
-    let t2 = isle2.eval("return tag").await.unwrap();
+    let t1: String = isle1.eval("return tag").await.unwrap();
+    let t2: String = isle2.eval("return tag").await.unwrap();
     let mut tags = [t1, t2];
     tags.sort();
     assert_eq!(
@@ -557,11 +557,11 @@ async fn scenario_mixed_workload_eval_and_coroutine() {
             // Alternate: even → coroutine path, odd → sync path.
             if i % 2 == 0 {
                 let code = format!("return {} + 100", i);
-                let r = isle.coroutine_eval(&code).await.unwrap();
-                assert_eq!(r, (i + 100).to_string());
+                let r: i64 = isle.coroutine_eval(&code).await.unwrap();
+                assert_eq!(r, i + 100);
             } else {
-                let r = isle.call("double", &[&i.to_string()]).await.unwrap();
-                assert_eq!(r, (i * 2).to_string());
+                let r: i64 = isle.call("double", i).await.unwrap();
+                assert_eq!(r, i * 2);
             }
         }));
     }
@@ -602,7 +602,7 @@ async fn scenario_lifecycle_kill_then_warm_reuse() {
     // Step 1: poison and kill.
     {
         let mut isle = pool.checkout().await.unwrap();
-        isle.eval("scratch = 'dirty'").await.unwrap();
+        isle.eval::<()>("scratch = 'dirty'").await.unwrap();
         isle.kill();
     }
 
@@ -617,15 +617,21 @@ async fn scenario_lifecycle_kill_then_warm_reuse() {
     // Step 2: fresh VM — factory ran again (base=7), scratch is gone.
     {
         let isle = pool.checkout().await.unwrap();
-        assert_eq!(isle.eval("return base").await.unwrap(), "7");
-        assert_eq!(isle.eval("return type(scratch)").await.unwrap(), "nil");
-        isle.eval("scratch = 'clean'").await.unwrap();
+        assert_eq!(isle.eval::<i64>("return base").await.unwrap(), 7);
+        assert_eq!(
+            isle.eval::<String>("return type(scratch)").await.unwrap(),
+            "nil"
+        );
+        isle.eval::<()>("scratch = 'clean'").await.unwrap();
     }
 
     // Step 3: warm round-trip on the new VM preserves state.
     {
         let isle = pool.checkout().await.unwrap();
-        assert_eq!(isle.eval("return scratch").await.unwrap(), "clean");
+        assert_eq!(
+            isle.eval::<String>("return scratch").await.unwrap(),
+            "clean"
+        );
     }
 
     pool.shutdown().await;

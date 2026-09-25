@@ -15,40 +15,26 @@ use std::sync::mpsc;
 pub(crate) fn run_loop(lua: mlua::Lua, rx: mpsc::Receiver<Request>) {
     while let Ok(req) = rx.recv() {
         match req {
-            Request::Eval { code, cancel, tx } => {
-                let result = execute_eval(&lua, &code, &cancel);
-                let _ = tx.send(result);
-            }
-            Request::Call {
-                func,
-                args,
-                cancel,
-                tx,
-            } => {
-                let result = execute_call(&lua, &func, &args, &cancel);
-                let _ = tx.send(result);
-            }
-            Request::Exec { f, cancel, tx } => {
-                let result = execute_exec(&lua, f, &cancel);
-                let _ = tx.send(result);
-            }
+            Request::Run { job, cancel } => job(&lua, &cancel),
             Request::Shutdown => break,
         }
     }
 }
 
-pub(crate) fn execute_eval(
+/// Run `code` as a sync `eval` and convert its return values to `T` on
+/// the VM thread.
+pub(crate) fn execute_eval<T: mlua::FromLuaMulti>(
     lua: &mlua::Lua,
     code: &str,
     cancel: &hook::CancelToken,
-) -> Result<String, IsleError> {
+) -> Result<T, IsleError> {
     crate::runtime::ensure_attached(lua)?;
     let _enter = hook::EnterGuard::new(cancel);
     let result = load_eval(lua, code)
         .map_err(IsleError::from)
         .and_then(|func| protect::call(lua, func, mlua::MultiValue::new()));
     let values = cancelled_wins(result, cancel)?;
-    lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
+    Ok(T::from_lua_multi(values, lua)?)
 }
 
 /// Chunk name of a sync `eval` (error positions read `eval:<line>:`).
@@ -81,11 +67,11 @@ pub(crate) fn cancelled_wins<T>(
     }
 }
 
-pub(crate) fn execute_exec(
+pub(crate) fn execute_exec<T>(
     lua: &mlua::Lua,
-    f: impl FnOnce(&mlua::Lua) -> Result<String, IsleError>,
+    f: impl FnOnce(&mlua::Lua) -> Result<T, IsleError>,
     cancel: &hook::CancelToken,
-) -> Result<String, IsleError> {
+) -> Result<T, IsleError> {
     crate::runtime::ensure_attached(lua)?;
     let _enter = hook::EnterGuard::new(cancel);
     f(lua)
@@ -100,68 +86,20 @@ pub(crate) fn global_function(lua: &mlua::Lua, name: &str) -> Result<mlua::Funct
     }
 }
 
-/// The string arguments of a `call` as Lua values.
-pub(crate) fn string_args(lua: &mlua::Lua, args: &[String]) -> Result<mlua::MultiValue, IsleError> {
-    let lua_args = args
-        .iter()
-        .map(|s| lua.create_string(s).map(mlua::Value::String))
-        .collect::<mlua::Result<Vec<_>>>()?;
-    Ok(mlua::MultiValue::from_vec(lua_args))
-}
-
-pub(crate) fn execute_call(
+/// Call the global function `func_name` with `args` as a sync `call`
+/// and convert its return values to `T`.  Both conversions run on the
+/// VM thread.
+pub(crate) fn execute_call<A: mlua::IntoLuaMulti, T: mlua::FromLuaMulti>(
     lua: &mlua::Lua,
     func_name: &str,
-    args: &[String],
+    args: A,
     cancel: &hook::CancelToken,
-) -> Result<String, IsleError> {
+) -> Result<T, IsleError> {
     crate::runtime::ensure_attached(lua)?;
     let _enter = hook::EnterGuard::new(cancel);
 
     let func = global_function(lua, func_name)?;
-    let multi = string_args(lua, args)?;
+    let multi = args.into_lua_multi(lua)?;
     let values = cancelled_wins(protect::call(lua, func, multi), cancel)?;
-    lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
-}
-
-/// Convert a Lua value to a String representation.
-///
-/// - `Nil` → empty string
-/// - `String` → the string
-/// - `Integer/Number/Boolean` → tostring
-/// - `Table` → serialized via tostring (or a simple repr)
-pub(crate) fn lua_value_to_string(lua: &mlua::Lua, val: mlua::Value) -> Result<String, IsleError> {
-    match val {
-        mlua::Value::Nil => Ok(String::new()),
-        mlua::Value::String(s) => s.to_str().map(|s| s.to_string()).map_err(IsleError::from),
-        mlua::Value::Integer(n) => Ok(n.to_string()),
-        mlua::Value::Number(n) => Ok(n.to_string()),
-        mlua::Value::Boolean(b) => Ok(b.to_string()),
-        other => {
-            // Use Lua's tostring() for tables and other types
-            let tostring: mlua::Function = lua.globals().get("tostring")?;
-            let s: String = tostring.call(other)?;
-            Ok(s)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lua_value_to_string_types() {
-        let lua = mlua::Lua::new();
-
-        assert_eq!(lua_value_to_string(&lua, mlua::Value::Nil).unwrap(), "");
-        assert_eq!(
-            lua_value_to_string(&lua, mlua::Value::Boolean(true)).unwrap(),
-            "true"
-        );
-        assert_eq!(
-            lua_value_to_string(&lua, mlua::Value::Integer(42)).unwrap(),
-            "42"
-        );
-    }
+    Ok(T::from_lua_multi(values, lua)?)
 }
