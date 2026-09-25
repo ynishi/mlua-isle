@@ -136,10 +136,13 @@ fn cancelling_vm_run_waits_for_a_host_task_to_drop() {
     });
 
     let out = l.run("bg() return sleep(5000)", Some(started));
-    assert_eq!(out.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(out.unwrap_err(), IsleError::Cancelled));
     assert!(dropped.get(), "run resolved before the host task dropped");
     let task = keep.borrow_mut().pop().unwrap();
-    assert_eq!(l.local.block_on(&l.rt, task), Err(IsleError::Cancelled));
+    assert!(matches!(
+        l.local.block_on(&l.rt, task),
+        Err(IsleError::Cancelled)
+    ));
 }
 
 #[test]
@@ -167,7 +170,7 @@ fn a_host_task_spawned_from_a_host_task_is_waited_for_too() {
     });
 
     let out = l.run("bg() return sleep(5000)", Some(started));
-    assert_eq!(out.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(out.unwrap_err(), IsleError::Cancelled));
     assert!(outer.get() && inner.get(), "a host task outlived run");
 }
 
@@ -190,10 +193,10 @@ fn an_unjoined_host_task_is_cancelled_and_waited_for_when_the_request_ends() {
 
     assert_eq!(first_int(l.run("bg() return 7", None)), 7);
     assert!(dropped.get(), "run resolved before the host task dropped");
-    assert_eq!(
+    assert!(matches!(
         l.local.block_on(&l.rt, held.borrow_mut().pop().unwrap()),
         Err(IsleError::Cancelled)
-    );
+    ));
 }
 
 // ── 2. case A: nothing runs into the next request ──
@@ -274,7 +277,10 @@ async fn case_a(handle: Handle) {
     // second tick shows the handle (held or detached) did not cancel it.
     wait_for_ticks(&ticks, 2).await;
     task.cancel();
-    assert_eq!(within(5000, task).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(5000, task).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     let at_resolve = ticks.load(Ordering::SeqCst);
 
     within(5000, isle.coroutine_eval("hold(50)")).await.unwrap();
@@ -304,7 +310,10 @@ async fn case_b(handle: Handle) {
     let task = isle.spawn_coroutine_eval("ticker() hold(5000)");
     wait_for_ticks(&ticks, 2).await;
     task.cancel();
-    assert_eq!(within(5000, task).await.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(
+        within(5000, task).await.unwrap_err(),
+        IsleError::Cancelled
+    ));
     // Without the scope (`current_token().child_token()` + a bare
     // `spawn_local`) this loop keeps the driver's `LocalSet` busy and
     // shutdown never returns; that reference case is not run here.
@@ -344,10 +353,9 @@ fn cancellable_inside_a_host_task_returns_the_cancel_error() {
     });
 
     let out = l.run("bg() return sleep(5000)", Some(started));
-    assert_eq!(out.unwrap_err(), IsleError::Cancelled);
-    assert_eq!(
-        result.borrow_mut().take(),
-        Some(Err(IsleError::Cancelled)),
+    assert!(matches!(out.unwrap_err(), IsleError::Cancelled));
+    assert!(
+        matches!(result.borrow_mut().take(), Some(Err(IsleError::Cancelled))),
         "cancellable did not return the cancel error"
     );
     let seen = seen_token.borrow_mut().take().expect("no current token");
@@ -355,7 +363,7 @@ fn cancellable_inside_a_host_task_returns_the_cancel_error() {
     assert!(request_token.borrow().as_ref().unwrap().is_cancelled());
     // The future itself finished (with the cancel error as its value).
     let task = keep.borrow_mut().pop().unwrap();
-    assert_eq!(l.local.block_on(&l.rt, task), Ok(()));
+    assert!(matches!(l.local.block_on(&l.rt, task), Ok(())));
 }
 
 // ── 5. where current_scope is Some ──
@@ -502,7 +510,7 @@ fn a_detached_host_task_runs_on_and_is_still_cancelled_and_waited_for() {
     // The request is cancelled only once the detached task has looped
     // three times, i.e. well after its handle was gone.
     let out = l.run("bg() return sleep(5000)", Some(ran_on));
-    assert_eq!(out.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(out.unwrap_err(), IsleError::Cancelled));
     assert!(count.get() >= 3);
     assert!(
         dropped.get(),
@@ -563,7 +571,7 @@ fn spawning_through_a_handle_after_its_request_ended_starts_nothing() {
             })
             .await
     });
-    assert_eq!(out.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(out.unwrap_err(), IsleError::Cancelled));
     assert!(!ran.get());
 }
 
@@ -613,7 +621,7 @@ fn a_host_task_spawned_during_cleanup_gets_the_remaining_grace() {
         let resolved_at = Instant::now();
         (out, canceller.await.unwrap(), resolved_at)
     });
-    assert_eq!(out.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(out.unwrap_err(), IsleError::Cancelled));
     let dropped_at = dropped_at.get().expect("the host task was not dropped");
     assert!(dropped_at <= resolved_at);
     let waited = dropped_at.duration_since(cancelled_at);
@@ -734,6 +742,9 @@ fn a_spawn_after_the_drain_deadline_starts_nothing() {
     assert!((1..1_000_000).contains(&n), "{n} links ran");
     // The last spawn came after the deadline: it started nothing.
     let refused = last.borrow_mut().take().expect("no spawn recorded");
-    assert_eq!(l.local.block_on(&l.rt, refused), Err(IsleError::Cancelled));
+    assert!(matches!(
+        l.local.block_on(&l.rt, refused),
+        Err(IsleError::Cancelled)
+    ));
     assert_eq!(links.get(), n, "the refused spawn ran its future");
 }

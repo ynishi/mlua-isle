@@ -4,6 +4,7 @@
 
 use crate::error::IsleError;
 use crate::hook;
+use crate::protect;
 use crate::Request;
 use std::sync::mpsc;
 
@@ -43,11 +44,40 @@ pub(crate) fn execute_eval(
 ) -> Result<String, IsleError> {
     crate::runtime::ensure_attached(lua)?;
     let _enter = hook::EnterGuard::new(cancel);
-    let result: mlua::Result<mlua::Value> = lua.load(code).eval();
+    let result = load_eval(lua, code)
+        .map_err(IsleError::from)
+        .and_then(|func| protect::call(lua, func, mlua::MultiValue::new()));
+    let values = cancelled_wins(result, cancel)?;
+    lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
+}
 
+/// Chunk name of a sync `eval` (error positions read `eval:<line>:`).
+pub(crate) const EVAL_CHUNK: &str = "=eval";
+
+/// Compile `code` the way [`mlua::Chunk::eval`] does: as an expression
+/// (`return <code>`) if that compiles, else as a block.  Both forms get
+/// the chunk name [`EVAL_CHUNK`].
+fn load_eval(lua: &mlua::Lua, code: &str) -> mlua::Result<mlua::Function> {
+    match lua
+        .load(format!("return {code}"))
+        .set_name(EVAL_CHUNK)
+        .into_function()
+    {
+        Ok(f) => Ok(f),
+        Err(_) => lua.load(code).set_name(EVAL_CHUNK).into_function(),
+    }
+}
+
+/// An error of a request whose token was cancelled is
+/// [`IsleError::Cancelled`], whatever the Lua code made of the cancel
+/// (it may have caught it and raised something else).
+pub(crate) fn cancelled_wins<T>(
+    result: Result<T, IsleError>,
+    cancel: &hook::CancelToken,
+) -> Result<T, IsleError> {
     match result {
-        Ok(val) => lua_value_to_string(lua, val),
-        Err(e) => Err(IsleError::from(e)),
+        Err(_) if cancel.is_cancelled() => Err(IsleError::Cancelled),
+        other => other,
     }
 }
 
@@ -61,6 +91,24 @@ pub(crate) fn execute_exec(
     f(lua)
 }
 
+/// The global function `name`, or [`IsleError::NotFound`] when the
+/// global is not a function.
+pub(crate) fn global_function(lua: &mlua::Lua, name: &str) -> Result<mlua::Function, IsleError> {
+    match lua.globals().get::<mlua::Value>(name)? {
+        mlua::Value::Function(f) => Ok(f),
+        _ => Err(IsleError::NotFound(name.to_string())),
+    }
+}
+
+/// The string arguments of a `call` as Lua values.
+pub(crate) fn string_args(lua: &mlua::Lua, args: &[String]) -> Result<mlua::MultiValue, IsleError> {
+    let lua_args = args
+        .iter()
+        .map(|s| lua.create_string(s).map(mlua::Value::String))
+        .collect::<mlua::Result<Vec<_>>>()?;
+    Ok(mlua::MultiValue::from_vec(lua_args))
+}
+
 pub(crate) fn execute_call(
     lua: &mlua::Lua,
     func_name: &str,
@@ -70,20 +118,10 @@ pub(crate) fn execute_call(
     crate::runtime::ensure_attached(lua)?;
     let _enter = hook::EnterGuard::new(cancel);
 
-    let func: mlua::Function = lua
-        .globals()
-        .get(func_name)
-        .map_err(|e| IsleError::Lua(format!("function '{func_name}' not found: {e}")))?;
-
-    let lua_args: Vec<mlua::Value> = args
-        .iter()
-        .map(|s| lua.create_string(s).map(mlua::Value::String))
-        .collect::<mlua::Result<Vec<_>>>()
-        .map_err(IsleError::from)?;
-
-    let multi = mlua::MultiValue::from_vec(lua_args);
-    let val: mlua::Value = func.call(multi).map_err(IsleError::from)?;
-    lua_value_to_string(lua, val)
+    let func = global_function(lua, func_name)?;
+    let multi = string_args(lua, args)?;
+    let values = cancelled_wins(protect::call(lua, func, multi), cancel)?;
+    lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
 }
 
 /// Convert a Lua value to a String representation.
@@ -95,22 +133,14 @@ pub(crate) fn execute_call(
 pub(crate) fn lua_value_to_string(lua: &mlua::Lua, val: mlua::Value) -> Result<String, IsleError> {
     match val {
         mlua::Value::Nil => Ok(String::new()),
-        mlua::Value::String(s) => s
-            .to_str()
-            .map(|s| s.to_string())
-            .map_err(|e| IsleError::Lua(format!("UTF-8 error: {e}"))),
+        mlua::Value::String(s) => s.to_str().map(|s| s.to_string()).map_err(IsleError::from),
         mlua::Value::Integer(n) => Ok(n.to_string()),
         mlua::Value::Number(n) => Ok(n.to_string()),
         mlua::Value::Boolean(b) => Ok(b.to_string()),
         other => {
             // Use Lua's tostring() for tables and other types
-            let tostring: mlua::Function = lua
-                .globals()
-                .get("tostring")
-                .map_err(|e| IsleError::Lua(format!("tostring not found: {e}")))?;
-            let s: String = tostring
-                .call(other)
-                .map_err(|e| IsleError::Lua(format!("tostring failed: {e}")))?;
+            let tostring: mlua::Function = lua.globals().get("tostring")?;
+            let s: String = tostring.call(other)?;
             Ok(s)
         }
     }

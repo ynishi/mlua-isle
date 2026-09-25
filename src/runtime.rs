@@ -39,8 +39,14 @@
 //!    abort, and a task in a CPU loop blocks `run` until it yields,
 //!    which without [`Config::preempt_every`] it never does.
 //! 2. **One error type**, [`IsleError`], on this layer and on the
-//!    actors.  Lua errors are carried as their message today; a typed
-//!    payload shared by both layers is issue #11.
+//!    actors, with one payload for a Lua error: [`IsleError::Lua`]
+//!    carries a [`LuaFailure`] (kind, message as Lua prints it,
+//!    traceback, and with the `serde` feature the raised value as
+//!    JSON), built on the VM thread from the raised value, the same
+//!    for `run` and for every actor request.  A cancel is
+//!    [`IsleError::Cancelled`], recognised by value: the cancel error
+//!    is `mlua::Error::external(`[`Cancelled`]`)`, found by downcast,
+//!    never by message.
 //! 3. **The layer owns the VM's debug hook.**  Register callbacks with
 //!    [`Vm::add_hook`], never with `Lua::set_hook` /
 //!    `Lua::set_global_hook`, which replace the hook and stop
@@ -51,6 +57,12 @@
 //! 5. **Cancellation is a token the host creates** and passes to
 //!    `run`; `run` spawns nothing and returns no handle.  Ctrl-C, a
 //!    timeout or a hook callback cancel that [`CancelToken`].
+//!
+//! Two requirements on the VM itself: attach it before sandboxing its
+//! globals (the first [`Vm::attach`] captures `xpcall`), and keep mlua's
+//! default `LuaOptions::catch_rust_panics = true`, whose `xpcall` is
+//! yieldable (with `false` every yield in a `run` root fails; see
+//! [`Vm::attach`]).
 //!
 //! Host functions called from Lua reach the running request or task
 //! through the context functions, which read a thread-local and so take
@@ -83,7 +95,6 @@
 //! })?;
 //! ```
 
-use crate::error::IsleError;
 use crate::hooks::{self, CancelConfig};
 use mlua::debug::Debug;
 use mlua::{HookTriggers, Lua, VmState};
@@ -91,6 +102,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::time::Duration;
 
+pub use crate::error::{Cancelled, IsleError, LuaErrorKind, LuaFailure};
 pub use crate::hook::{current_token, CancelToken};
 pub use crate::hooks::HookId;
 #[cfg(feature = "tokio")]
@@ -177,7 +189,28 @@ impl Vm {
     ///
     /// Hook callbacks registered before (with [`Vm::add_hook`] or
     /// [`hooks::add_hook`]) are kept.
+    ///
+    /// The first `attach` also captures the `xpcall` global, which
+    /// [`Vm::run`] uses to bring a raised Lua value back as a value (see
+    /// [`LuaFailure`]).  **Attach before sandboxing the globals**
+    /// (removing `xpcall`, or [`Lua::set_globals`] with a whitelist):
+    /// after that the capture is kept, and later changes to the globals
+    /// or a re-attach do not affect it.
+    ///
+    /// **The coroutine path needs mlua's default
+    /// `LuaOptions::catch_rust_panics = true`.**  With `false`, mlua
+    /// replaces the global `xpcall` with a version that is not
+    /// yieldable, so every yield in a root run by [`Vm::run`] (an async
+    /// host function, `task.join`, preemption) fails with "attempt to
+    /// yield across a C-call boundary".  [`Lua::new`] uses the default.
+    ///
+    /// # Errors
+    ///
+    /// [`IsleError::Init`] with [`LuaErrorKind::External`] when the VM's
+    /// `xpcall` global is not a function (it was sandboxed away before
+    /// the first attach).
     pub fn attach(lua: &Lua, config: Config) -> Result<Vm, IsleError> {
+        crate::protect::install(lua)?;
         hooks::install(lua)?;
         hooks::configure(lua, config.into());
         let attached = lua.app_data_ref::<Attached>().is_some();
@@ -213,6 +246,9 @@ impl Vm {
     /// the usual case, because the new thread has hooks enabled while
     /// the hooked thread does not.  That inner call fails with
     /// [`mlua::Error::RecursiveMutCallback`].
+    ///
+    /// Call and return callbacks also see the call of the crate's error
+    /// message handler; see [`hooks::add_hook`] for what that means.
     pub fn add_hook<F>(&self, triggers: HookTriggers, f: F) -> Result<HookId, IsleError>
     where
         F: FnMut(&Lua, &Debug) -> mlua::Result<VmState> + 'static,

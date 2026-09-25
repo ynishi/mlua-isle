@@ -156,8 +156,12 @@ fn init_error_propagates() {
     });
     assert!(result.is_err());
     match result.err().unwrap() {
-        IsleError::Init(msg) => {
-            assert!(!msg.is_empty(), "init error message should not be empty");
+        IsleError::Init(f) => {
+            assert_eq!(f.kind, mlua_isle::LuaErrorKind::Syntax);
+            assert!(
+                !f.message.is_empty(),
+                "init error message should not be empty"
+            );
         }
         other => panic!("expected Init error, got: {other}"),
     }
@@ -210,7 +214,7 @@ fn spawn_exec_cancel() {
 
     let result = task.wait();
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
 
     isle.shutdown().unwrap();
 }
@@ -295,7 +299,7 @@ fn concurrent_spawn_eval_with_cancel() {
         std::thread::sleep(Duration::from_millis(30));
         task.cancel();
         let result = task.wait();
-        assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+        assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
     });
 
     long_handle.join().expect("long task thread panicked");
@@ -371,7 +375,7 @@ async fn cancel_from_tokio_task() {
     .await
     .expect("spawn_blocking panicked");
 
-    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
 
     // Isle still functional after cancel
     let isle_c = Arc::clone(&isle);
@@ -421,9 +425,163 @@ fn spawn_eval_cancel_loop_in_lua_created_coroutine() {
         );
         std::thread::sleep(Duration::from_millis(5));
     };
-    assert_eq!(result.unwrap_err(), IsleError::Cancelled);
+    assert!(matches!(result.unwrap_err(), IsleError::Cancelled));
 
     // The isle is still usable.
     assert_eq!(isle.eval("return 1").unwrap(), "1");
     isle.shutdown().unwrap();
+}
+
+// ── typed errors (#11), sync `Isle` ──────────────────────────────────
+
+#[derive(Debug)]
+struct MyErr(u32);
+
+impl std::fmt::Display for MyErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "my error {}", self.0)
+    }
+}
+
+impl std::error::Error for MyErr {}
+
+fn lua_failure(r: Result<String, IsleError>) -> mlua_isle::LuaFailure {
+    match r {
+        Err(IsleError::Lua(f)) => f,
+        other => panic!("expected IsleError::Lua, got: {other:?}"),
+    }
+}
+
+#[test]
+fn eval_raised_table_is_a_lua_failure_with_its_value() {
+    let isle = Isle::spawn(|_| Ok(())).unwrap();
+    let f =
+        lua_failure(isle.eval(
+            "error(setmetatable({ code = 42 }, { __tostring = function() return 'E42' end }))",
+        ));
+    assert_eq!(f.kind, mlua_isle::LuaErrorKind::Runtime);
+    assert_eq!(f.message, "E42");
+    assert_eq!(f.to_string(), "E42");
+    assert!(
+        f.traceback
+            .as_deref()
+            .unwrap_or("")
+            .contains("stack traceback"),
+        "traceback: {:?}",
+        f.traceback
+    );
+    #[cfg(feature = "serde")]
+    assert_eq!(f.value.as_ref().unwrap()["code"], 42);
+
+    // Without `__tostring` the message is what `tostring` gives.
+    let f = lua_failure(isle.eval("error({ code = 42 })"));
+    assert!(f.message.starts_with("table: "), "got: {}", f.message);
+    #[cfg(feature = "serde")]
+    assert_eq!(f.value.as_ref().unwrap()["code"], 42);
+    isle.shutdown().unwrap();
+}
+
+#[test]
+fn eval_string_error_and_syntax_error_kinds() {
+    let isle = Isle::spawn(|_| Ok(())).unwrap();
+    let f = lua_failure(isle.eval("error('boom')"));
+    assert_eq!(f.kind, mlua_isle::LuaErrorKind::Runtime);
+    assert!(f.message.ends_with(": boom"), "got: {}", f.message);
+    #[cfg(feature = "serde")]
+    assert_eq!(f.value, Some(serde_json::json!(f.message)));
+
+    let f = lua_failure(isle.eval("x = = 1"));
+    assert_eq!(f.kind, mlua_isle::LuaErrorKind::Syntax);
+    assert!(!f.message.is_empty());
+    isle.shutdown().unwrap();
+}
+
+#[test]
+fn eval_host_function_error_is_a_callback_failure() {
+    let isle = Isle::spawn(|lua| {
+        let fail = lua.create_function(|_, ()| -> mlua::Result<()> {
+            Err(mlua::Error::external(MyErr(7)))
+        })?;
+        lua.globals().set("fail", fail)
+    })
+    .unwrap();
+    let f = lua_failure(isle.eval("fail()"));
+    assert_eq!(f.kind, mlua_isle::LuaErrorKind::Callback);
+    assert_eq!(f.message, "my error 7");
+    assert!(f.traceback.is_some());
+    #[cfg(feature = "serde")]
+    assert_eq!(f.value, None);
+    isle.shutdown().unwrap();
+}
+
+#[test]
+fn eval_error_with_the_old_sentinel_is_not_a_cancel() {
+    let isle = Isle::spawn(|_| Ok(())).unwrap();
+    let f = lua_failure(isle.eval("error('__isle_cancelled__')"));
+    assert!(
+        f.message.ends_with("__isle_cancelled__"),
+        "got: {}",
+        f.message
+    );
+    isle.shutdown().unwrap();
+}
+
+#[test]
+fn cancelled_eval_is_cancelled_even_when_lua_replaces_the_error() {
+    let isle = Isle::spawn(|_| Ok(())).unwrap();
+    // The Lua code catches the cancel and raises a string instead.
+    let task =
+        isle.spawn_eval("local ok = pcall(function() while true do end end) error('swallowed')");
+    std::thread::sleep(Duration::from_millis(20));
+    task.cancel();
+    assert!(matches!(task.wait(), Err(IsleError::Cancelled)));
+    isle.shutdown().unwrap();
+}
+
+#[test]
+fn call_of_a_missing_global_is_not_found() {
+    let isle = Isle::spawn(|lua| lua.globals().set("n", 1)).unwrap();
+    assert!(matches!(isle.call("nope", &[]), Err(IsleError::NotFound(n)) if n == "nope"));
+    assert!(matches!(isle.call("n", &[]), Err(IsleError::NotFound(n)) if n == "n"));
+    isle.shutdown().unwrap();
+}
+
+#[test]
+fn init_error_is_a_lua_failure() {
+    let err = Isle::spawn(|_| Err(mlua::Error::runtime("nope")))
+        .err()
+        .expect("init must fail");
+    match err {
+        IsleError::Init(f) => {
+            assert_eq!(f.kind, mlua_isle::LuaErrorKind::Runtime);
+            assert_eq!(f.message, "nope");
+        }
+        other => panic!("expected Init, got: {other:?}"),
+    }
+}
+
+#[test]
+fn init_panic_is_thread_panic_with_the_message() {
+    let err = Isle::spawn(|_| panic!("init boom"))
+        .err()
+        .expect("init must fail");
+    assert!(
+        matches!(&err, IsleError::ThreadPanic(Some(m)) if m == "init boom"),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn request_panic_is_recv_failed_then_thread_panic_on_shutdown() {
+    let isle = Isle::spawn(|lua| {
+        let boom = lua.create_function(|_, ()| -> mlua::Result<()> { panic!("request boom") })?;
+        lua.globals().set("boom", boom)
+    })
+    .unwrap();
+    assert!(matches!(isle.eval("boom()"), Err(IsleError::RecvFailed)));
+    let err = isle.shutdown().unwrap_err();
+    assert!(
+        matches!(&err, IsleError::ThreadPanic(Some(m)) if m == "request boom"),
+        "got: {err:?}"
+    );
 }

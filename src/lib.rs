@@ -63,6 +63,7 @@ mod hook;
 pub mod hooks;
 #[cfg(feature = "pool")]
 mod pool;
+mod protect;
 pub mod runtime;
 mod task;
 mod thread;
@@ -78,7 +79,7 @@ mod scope;
 #[cfg(feature = "tokio")]
 pub mod tasks;
 
-pub use error::IsleError;
+pub use error::{Cancelled, IsleError, LuaErrorKind, LuaFailure};
 pub use handle::Isle;
 pub use hook::{current_token, CancelToken};
 #[cfg(feature = "tokio")]

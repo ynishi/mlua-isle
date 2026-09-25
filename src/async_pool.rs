@@ -116,7 +116,10 @@ impl AsyncIslePool {
         F: Fn(&mlua::Lua) -> Result<(), mlua::Error> + Send + Sync + 'static,
     {
         if config.max_size == 0 {
-            return Err(IsleError::Init("max_size must be > 0".into()));
+            return Err(IsleError::Init(crate::LuaFailure::new(
+                crate::LuaErrorKind::External,
+                "max_size must be > 0",
+            )));
         }
 
         Ok(Self {

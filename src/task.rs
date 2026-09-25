@@ -40,7 +40,7 @@ impl<T> Task<T> {
     pub fn wait(self) -> Result<T, IsleError> {
         let result = self.rx.recv();
         self.released.set(true);
-        result.map_err(|e| IsleError::RecvFailed(e.to_string()))?
+        result.map_err(|_| IsleError::RecvFailed)?
     }
 
     /// Let the operation run to completion without this handle.
