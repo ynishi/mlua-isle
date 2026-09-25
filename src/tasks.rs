@@ -15,7 +15,12 @@
 //! the tasks it spawned and did not join are cancelled, and it waits
 //! for them before its own result is delivered.  Cancelling a request
 //! or task cancels all of its tasks (their tokens are
-//! [children](crate::CancelToken::child_token) of its token).
+//! [children](crate::CancelToken::child_token) of its token), and the
+//! cancelled request or task still resolves only after they, and their
+//! own tasks, have finished or been dropped.  The cancel
+//! [grace period](crate::hooks::CancelConfig::grace) is one deadline for
+//! the whole tree: a task spawned during cleanup gets the time that
+//! remains, not a fresh grace period.
 //!
 //! `task.spawn` works inside coroutine requests
 //! ([`AsyncIsle::coroutine_eval`](crate::AsyncIsle::coroutine_eval) /
@@ -28,6 +33,14 @@
 //! [`CancelConfig::preempt_every`](crate::hooks::CancelConfig::preempt_every)
 //! for that.  Cancelling from another thread (an [`AsyncTask`](crate::AsyncTask)
 //! handle) works without it.
+//!
+//! A host function that starts work of its own with
+//! [`current_token()`](crate::current_token)`.child_token()` and
+//! `spawn_local` gets cancellation, but the request does not wait for
+//! that work before it resolves.  To have the request wait, do the work
+//! inside the future of a
+//! [`create_async_function`](mlua::Lua::create_async_function), so the
+//! coroutine awaits it.
 
 use crate::scope::{self, FinishOnDrop, Outcome, TaskState, WRAP_PCALL};
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
@@ -134,18 +147,20 @@ pub fn install(lua: &Lua) -> mlua::Result<Table> {
             .ok_or_else(|| mlua::Error::runtime("task.spawn: no current cancel token"))?;
         let token = parent.child_token();
         let state = Rc::new(TaskState::new(token.clone()));
+        let grace = crate::hooks::config(lua).grace;
         let run = scope::scoped_call(
             lua,
             token.clone(),
+            grace,
+            Some(scope.clone()),
             WRAP_PCALL,
             f,
             MultiValue::from_iter(args),
         )?;
-        let grace = crate::hooks::config(lua).grace;
         let st = state.clone();
         let handle = tokio::task::spawn_local(async move {
             let finish = FinishOnDrop(st.clone());
-            let out = scope::with_grace(&token, grace, run).await;
+            let out = run.await;
             let outcome = match out {
                 None => Outcome::Cancelled,
                 Some(Ok(values)) => {

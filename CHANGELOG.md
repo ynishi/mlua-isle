@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Changed
+- The cancel grace period is now one deadline shared by a request or
+  task and the tasks it spawns, transitively.  A task spawned during
+  cleanup gets the remaining time instead of a fresh grace period, and a
+  task that observes the cancel late still ends by its parent's
+  deadline, so the total wait no longer grows with how deep cleanup
+  spawns tasks or with the order in which tasks run.
+
+### Fixed
+- Cancelling a coroutine request, a `run_root` call or a task now waits
+  for the tasks it spawned, transitively, to finish or be dropped before
+  it resolves.  Previously it resolved first and only scheduled those
+  tasks for abort, so their coroutines and the host futures they were
+  awaiting could be dropped later, inside the next request on the same
+  VM.
+
 ## [0.7.0] - 2026-09-24
 
 ### Added
