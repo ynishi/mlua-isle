@@ -587,8 +587,9 @@ struct CancelledRoot {
 /// one resolved.
 ///
 /// `hsleep()` holds the host future for 1000 ms and is not
-/// `cancellable`: only dropping its future releases it.  `mark()`
-/// records that the second root ran.
+/// `cancellable`: only dropping its future releases it.  `hold(ms)` is
+/// not cancellable either and logs nothing; `sleep(ms)` is
+/// `cancellable`.  `mark()` records that the second root ran.
 fn cancel_run_root(config: CancelConfig, src: &str, second: Option<&str>) -> CancelledRoot {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -621,6 +622,22 @@ fn cancel_run_root(config: CancelConfig, src: &str, second: Option<&str>) -> Can
         })
         .unwrap();
     lua.globals().set("hsleep", hsleep).unwrap();
+    let hold = lua
+        .create_async_function(|_, ms: u64| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok(())
+        })
+        .unwrap();
+    lua.globals().set("hold", hold).unwrap();
+    let sleep = lua
+        .create_async_function(|_, ms: u64| {
+            cancellable(async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok(())
+            })
+        })
+        .unwrap();
+    lua.globals().set("sleep", sleep).unwrap();
     let l = log.clone();
     let mark = lua
         .create_function(move |_, ()| {
@@ -719,6 +736,62 @@ fn cancelling_run_root_with_grace_still_waits_for_the_grandchild() {
     let waited = assert_dropped_before_resolve(&r);
     assert!(
         waited >= Duration::from_millis(90) && waited < Duration::from_millis(400),
+        "dropped after {waited:?}"
+    );
+}
+
+// ── one grace deadline for the whole task tree ──
+
+/// The root's `__close` spends half the grace, then starts a task that
+/// holds a host future and joins it.
+const SPAWN_IN_CLEANUP: &str = "local cleanup <close> = setmetatable({}, { __close = function()
+       hold(100)
+       local t = task.spawn(function() return hsleep() end)
+       t:join()
+     end })
+     return sleep(5000)";
+
+/// As [`SPAWN_IN_CLEANUP`], but the task's own `__close` spends another
+/// quarter of the grace and starts the task that holds the host future.
+const SPAWN_IN_NESTED_CLEANUP: &str =
+    "local cleanup <close> = setmetatable({}, { __close = function()
+       hold(100)
+       local t = task.spawn(function()
+         local inner <close> = setmetatable({}, { __close = function()
+           hold(50)
+           local g = task.spawn(function() return hsleep() end)
+           g:join()
+         end })
+         return sleep(5000)
+       end)
+       t:join()
+     end })
+     return sleep(5000)";
+
+const TREE_GRACE: CancelConfig = CancelConfig {
+    grace: Duration::from_millis(200),
+    preempt_every: None,
+};
+
+#[test]
+fn a_task_spawned_during_cleanup_gets_the_remaining_grace() {
+    let r = cancel_run_root(TREE_GRACE, SPAWN_IN_CLEANUP, None);
+    let waited = assert_dropped_before_resolve(&r);
+    // One deadline at cancel + 200 ms.  A fresh grace from the task's
+    // start would drop it at about cancel + 300 ms.
+    assert!(
+        waited >= Duration::from_millis(190) && waited < Duration::from_millis(260),
+        "dropped after {waited:?}"
+    );
+}
+
+#[test]
+fn the_grace_deadline_does_not_grow_with_depth() {
+    let r = cancel_run_root(TREE_GRACE, SPAWN_IN_NESTED_CLEANUP, None);
+    let waited = assert_dropped_before_resolve(&r);
+    // A fresh grace per level would drop it at about cancel + 350 ms.
+    assert!(
+        waited >= Duration::from_millis(190) && waited < Duration::from_millis(260),
         "dropped after {waited:?}"
     );
 }

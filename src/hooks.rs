@@ -70,6 +70,11 @@ pub struct CancelConfig {
     /// released, and pending `__close` handlers run without being able
     /// to yield (a Lua 5.4 restriction).
     ///
+    /// The grace period is one deadline for the cancelled request or
+    /// task and every task it spawned, transitively: a task started
+    /// during cleanup (from a `__close` handler, say) gets the time that
+    /// remains, not a fresh grace period.
+    ///
     /// Default: zero (drop at once).
     pub grace: Duration,
     /// Yield the running coroutine request or task every this many

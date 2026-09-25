@@ -17,6 +17,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// Wraps a request body: marks the isle-created coroutine, then calls.
 ///
@@ -72,9 +73,17 @@ impl Drop for ScopeEnterGuard {
 #[derive(Default)]
 pub(crate) struct Scope {
     children: RefCell<Vec<Rc<TaskState>>>,
+    /// When the coroutine is dropped, once it has been cancelled.  A task
+    /// spawned from it after that inherits this deadline.
+    deadline: Cell<Option<Instant>>,
 }
 
 impl Scope {
+    /// The grace deadline of this scope's coroutine, if it was cancelled.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline.get()
+    }
+
     pub(crate) fn add(&self, child: Rc<TaskState>) {
         let mut children = self.children.borrow_mut();
         children.retain(|c| !c.is_done());
@@ -220,7 +229,10 @@ impl Drop for AbortOnDrop {
 /// under `token`.  `wrap` is [`WRAP_CALL`] or [`WRAP_PCALL`].
 ///
 /// Once `token` is cancelled, the coroutine gets `grace` to finish and
-/// is then dropped; the future yields `None` in that case.
+/// is then dropped; the future yields `None` in that case.  `inherited`
+/// is the deadline of the spawning coroutine's scope, if that coroutine
+/// was already cancelled: the grace never ends later than it, so a task
+/// started during its parent's cleanup gets only the remaining time.
 ///
 /// Either way, the returned future resolves only after the tasks the
 /// coroutine spawned (and did not join) have been cancelled and have
@@ -232,6 +244,7 @@ pub(crate) fn scoped_call(
     lua: &Lua,
     token: CancelToken,
     grace: Duration,
+    inherited: Option<Instant>,
     wrap: &str,
     func: Function,
     args: MultiValue,
@@ -260,8 +273,9 @@ pub(crate) fn scoped_call(
         // The tasks are not aborted here: aborting a task drops its
         // future before it waits for its own tasks.  Their tokens are
         // children of `token`, so they were cancelled with it, and each
-        // one ends after its own grace and its own wait.
-        let out = with_grace(&token, grace, run).await;
+        // one ends by the same deadline (see `with_grace`) and then
+        // waits for its own tasks.
+        let out = with_grace(&token, grace, inherited, &scope, run).await;
         scope.cancel_all();
         scope.wait_all().await;
         guard.disarm();
@@ -269,16 +283,29 @@ pub(crate) fn scoped_call(
     })
 }
 
-/// Run `fut`; once `token` is cancelled, give it `grace` to finish and
-/// then drop it.  Returns `None` when it was dropped.
-async fn with_grace<F: Future>(token: &CancelToken, grace: Duration, fut: F) -> Option<F::Output> {
+/// Run `fut`; once `token` is cancelled, let it run until
+/// `now + grace` or `inherited`, whichever is earlier, and then drop it.
+/// The deadline is stored in `scope`, so the tasks `fut` spawns during
+/// its cleanup inherit it.  Returns `None` when `fut` was dropped.
+///
+/// A deadline already in the past still gives `fut` one poll.
+async fn with_grace<F: Future>(
+    token: &CancelToken,
+    grace: Duration,
+    inherited: Option<Instant>,
+    scope: &Scope,
+    fut: F,
+) -> Option<F::Output> {
     tokio::pin!(fut);
     tokio::select! {
         biased;
         out = &mut fut => return Some(out),
         _ = token.cancelled() => {}
     }
-    tokio::time::timeout(grace, fut).await.ok()
+    let own = Instant::now() + grace;
+    let deadline = inherited.map_or(own, |d| d.min(own));
+    scope.deadline.set(Some(deadline));
+    tokio::time::timeout_at(deadline, fut).await.ok()
 }
 
 /// Make an async host function's future stop when the calling request
@@ -342,7 +369,9 @@ where
 ///
 /// On cancel, the coroutine gets the grace period and is then dropped,
 /// and this resolves only after the tasks it spawned, transitively,
-/// have finished or been dropped (each after its own grace period).
+/// have finished or been dropped.  The grace period is one deadline for
+/// the coroutine and all of those tasks: a task started during cleanup
+/// gets the time that remains, not a grace period of its own.
 /// So nothing the cancelled call started is still alive when the next
 /// call on the VM begins.  A task in a CPU loop cannot be dropped until
 /// it yields; without
@@ -356,7 +385,7 @@ pub async fn run_root(
 ) -> Result<MultiValue, crate::IsleError> {
     hooks::ensure_installed(lua)?;
     let grace = hooks::config(lua).grace;
-    let out = scoped_call(lua, token.clone(), grace, WRAP_CALL, func, args)?.await;
+    let out = scoped_call(lua, token.clone(), grace, None, WRAP_CALL, func, args)?.await;
     if token.is_cancelled() {
         return Err(crate::IsleError::Cancelled);
     }

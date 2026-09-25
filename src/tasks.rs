@@ -17,7 +17,10 @@
 //! or task cancels all of its tasks (their tokens are
 //! [children](crate::CancelToken::child_token) of its token), and the
 //! cancelled request or task still resolves only after they, and their
-//! own tasks, have finished or been dropped.
+//! own tasks, have finished or been dropped.  The cancel
+//! [grace period](crate::hooks::CancelConfig::grace) is one deadline for
+//! the whole tree: a task spawned during cleanup gets the time that
+//! remains, not a fresh grace period.
 //!
 //! `task.spawn` works inside coroutine requests
 //! ([`AsyncIsle::coroutine_eval`](crate::AsyncIsle::coroutine_eval) /
@@ -141,6 +144,7 @@ pub fn install(lua: &Lua) -> mlua::Result<Table> {
             lua,
             token.clone(),
             grace,
+            scope.deadline(),
             WRAP_PCALL,
             f,
             MultiValue::from_iter(args),
