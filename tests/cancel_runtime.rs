@@ -64,7 +64,7 @@ async fn within<F: std::future::Future>(ms: u64, f: F) -> F::Output {
 #[tokio::test]
 async fn join_returns_all_values() {
     let (isle, driver) = isle().await;
-    let r = isle
+    let r: String = isle
         .coroutine_eval(
             "local h = task.spawn(function(a, b) sleep(5) return a + b, a * b end, 3, 4)
              local ok, s, p = h:join()
@@ -79,7 +79,7 @@ async fn join_returns_all_values() {
 #[tokio::test]
 async fn join_keeps_the_raw_error_value() {
     let (isle, driver) = isle().await;
-    let r = isle
+    let r: String = isle
         .coroutine_eval(
             "local h = task.spawn(function() error({ code = 42 }) end)
              local ok, err = h:join()
@@ -95,7 +95,7 @@ async fn join_keeps_the_raw_error_value() {
 async fn tasks_run_concurrently() {
     let (isle, driver) = isle().await;
     let start = Instant::now();
-    isle.coroutine_eval(
+    isle.coroutine_eval::<()>(
         "local a = task.spawn(function() sleep(100) end)
          local b = task.spawn(function() sleep(100) end)
          a:join() b:join()",
@@ -114,7 +114,7 @@ async fn tasks_run_concurrently() {
 async fn second_join_is_an_error() {
     let (isle, driver) = isle().await;
     let err = isle
-        .coroutine_eval("local h = task.spawn(function() end) h:join() h:join()")
+        .coroutine_eval::<()>("local h = task.spawn(function() end) h:join() h:join()")
         .await
         .unwrap_err();
     assert!(err.to_string().contains("already joined"), "got: {err}");
@@ -124,7 +124,7 @@ async fn second_join_is_an_error() {
 #[tokio::test]
 async fn cancelled_task_joins_as_cancelled() {
     let (isle, driver) = isle().await;
-    let r = isle
+    let r: String = isle
         .coroutine_eval(
             "local h = task.spawn(function() sleep(5000) end)
              sleep(10)
@@ -141,7 +141,10 @@ async fn cancelled_task_joins_as_cancelled() {
 #[tokio::test]
 async fn spawn_in_a_sync_request_is_an_error() {
     let (isle, driver) = isle().await;
-    let err = isle.eval("task.spawn(function() end)").await.unwrap_err();
+    let err = isle
+        .eval::<()>("task.spawn(function() end)")
+        .await
+        .unwrap_err();
     assert!(
         err.to_string()
             .contains("not inside a coroutine request or task"),
@@ -155,11 +158,11 @@ async fn spawn_in_a_sync_request_is_an_error() {
 #[tokio::test]
 async fn unjoined_tasks_are_cancelled_and_awaited_when_the_request_ends() {
     let (isle, driver) = isle().await;
-    isle.eval("closed = false").await.unwrap();
+    isle.eval::<()>("closed = false").await.unwrap();
     let start = Instant::now();
     let r = within(
         2000,
-        isle.coroutine_eval(
+        isle.coroutine_eval::<String>(
             "task.spawn(function()
                local g <close> = setmetatable({}, { __close = function() closed = true end })
                sleep(5000)
@@ -173,14 +176,14 @@ async fn unjoined_tasks_are_cancelled_and_awaited_when_the_request_ends() {
     assert_eq!(r, "parent done");
     assert!(start.elapsed() < Duration::from_millis(1000));
     // The request resolved only after the child had finished.
-    assert_eq!(isle.eval("return closed").await.unwrap(), "true");
+    assert!(isle.eval::<bool>("return closed == true").await.unwrap());
     driver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn close_on_handle_cancels_and_waits() {
     let (isle, driver) = isle().await;
-    let r = isle
+    let r: String = isle
         .coroutine_eval(
             "local closed = false
              do
@@ -202,7 +205,7 @@ async fn close_on_handle_cancels_and_waits() {
 async fn cancelling_the_request_reaches_grandchildren() {
     let drops = Arc::new(Mutex::new(Vec::new()));
     let (isle, driver) = isle_with(CancelConfig::default(), drops.clone()).await;
-    let task = isle.spawn_coroutine_eval(
+    let task = isle.spawn_coroutine_eval::<()>(
         "task.spawn(function()
            task.spawn(function() probe(5000, 'grandchild') end)
            probe(5000, 'child')
@@ -262,7 +265,7 @@ async fn host_functions_can_derive_child_tokens() {
     })
     .await
     .unwrap();
-    let task = isle.spawn_coroutine_eval("watch() hold(5000)");
+    let task = isle.spawn_coroutine_eval::<()>("watch() hold(5000)");
     tokio::time::sleep(Duration::from_millis(30)).await;
     task.cancel();
     let _ = task.await;
@@ -282,7 +285,7 @@ async fn preemption_lets_a_sibling_cancel_a_cpu_loop() {
     let (isle, driver) = isle_with(config, Default::default()).await;
     let r = within(
         2000,
-        isle.coroutine_eval(
+        isle.coroutine_eval::<String>(
             "local h = task.spawn(function() while true do end end)
              sleep(20)
              h:cancel()
@@ -305,7 +308,7 @@ async fn preemption_does_not_yield_lua_created_coroutines() {
     let (isle, driver) = isle_with(config, Default::default()).await;
     let r = within(
         5000,
-        isle.coroutine_eval(
+        isle.coroutine_eval::<String>(
             "local h = task.spawn(function()
                local co = coroutine.wrap(function()
                  local n = 0
@@ -331,10 +334,13 @@ async fn preemption_interleaves_cpu_bound_requests() {
         ..Default::default()
     };
     let (isle, driver) = isle_with(config, Default::default()).await;
-    let spin = isle.spawn_coroutine_eval("while true do end");
-    let r = within(2000, isle.coroutine_eval("return 'still responsive'"))
-        .await
-        .unwrap();
+    let spin = isle.spawn_coroutine_eval::<()>("while true do end");
+    let r = within(
+        2000,
+        isle.coroutine_eval::<String>("return 'still responsive'"),
+    )
+    .await
+    .unwrap();
     assert_eq!(r, "still responsive");
     spin.cancel();
     assert!(matches!(
@@ -353,8 +359,8 @@ async fn grace_lets_close_handlers_await() {
         ..Default::default()
     };
     let (isle, driver) = isle_with(config, Default::default()).await;
-    isle.eval("cleaned = false").await.unwrap();
-    let task = isle.spawn_coroutine_eval(
+    isle.eval::<()>("cleaned = false").await.unwrap();
+    let task = isle.spawn_coroutine_eval::<()>(
         "local g <close> = setmetatable({}, { __close = function()
            hold(20)
            cleaned = true
@@ -367,15 +373,15 @@ async fn grace_lets_close_handlers_await() {
         within(1000, task).await.unwrap_err(),
         IsleError::Cancelled
     ));
-    assert_eq!(isle.eval("return cleaned").await.unwrap(), "true");
+    assert!(isle.eval::<bool>("return cleaned == true").await.unwrap());
     driver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn without_grace_an_awaiting_close_handler_cannot_finish() {
     let (isle, driver) = isle().await;
-    isle.eval("cleaned = false").await.unwrap();
-    let task = isle.spawn_coroutine_eval(
+    isle.eval::<()>("cleaned = false").await.unwrap();
+    let task = isle.spawn_coroutine_eval::<()>(
         "local g <close> = setmetatable({}, { __close = function()
            hold(20)
            cleaned = true
@@ -389,7 +395,7 @@ async fn without_grace_an_awaiting_close_handler_cannot_finish() {
         IsleError::Cancelled
     ));
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(isle.eval("return cleaned").await.unwrap(), "false");
+    assert!(isle.eval::<bool>("return cleaned == false").await.unwrap());
     driver.shutdown().await.unwrap();
 }
 
@@ -402,7 +408,7 @@ async fn grace_ends_with_a_hard_drop() {
     let drops = Arc::new(Mutex::new(Vec::new()));
     let (isle, driver) = isle_with(config, drops.clone()).await;
     // `probe` is not cancellable: only the hard drop releases it.
-    let task = isle.spawn_coroutine_eval("probe(5000, 'held')");
+    let task = isle.spawn_coroutine_eval::<()>("probe(5000, 'held')");
     tokio::time::sleep(Duration::from_millis(30)).await;
     let cancelled_at = Instant::now();
     task.cancel();
@@ -424,31 +430,31 @@ async fn grace_ends_with_a_hard_drop() {
 #[tokio::test]
 async fn dropping_an_async_task_cancels_it() {
     let (isle, driver) = isle().await;
-    drop(isle.spawn_eval("while true do end"));
+    drop(isle.spawn_eval::<()>("while true do end"));
     // Would block forever if the loop were still running.
-    assert_eq!(within(2000, isle.eval("return 1")).await.unwrap(), "1");
+    assert_eq!(within(2000, isle.eval::<i64>("return 1")).await.unwrap(), 1);
     driver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn a_detached_async_task_runs_to_completion() {
     let (isle, driver) = isle().await;
-    isle.eval("finished = false").await.unwrap();
-    isle.spawn_coroutine_eval("sleep(20) finished = true")
+    isle.eval::<()>("finished = false").await.unwrap();
+    isle.spawn_coroutine_eval::<()>("sleep(20) finished = true")
         .detach();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(isle.eval("return finished").await.unwrap(), "true");
+    assert!(isle.eval::<bool>("return finished == true").await.unwrap());
     driver.shutdown().await.unwrap();
 }
 
 #[test]
 fn dropping_a_sync_task_cancels_it_and_detach_does_not() {
     let isle = mlua_isle::Isle::spawn(|_| Ok(())).unwrap();
-    drop(isle.spawn_eval("while true do end"));
-    assert_eq!(isle.eval("return 1").unwrap(), "1");
+    drop(isle.spawn_eval::<()>("while true do end"));
+    assert_eq!(isle.eval::<i64>("return 1").unwrap(), 1);
 
-    isle.spawn_eval("finished = true").detach();
-    assert_eq!(isle.eval("return finished").unwrap(), "true");
+    isle.spawn_eval::<()>("finished = true").detach();
+    assert!(isle.eval::<bool>("return finished == true").unwrap());
     isle.shutdown().unwrap();
 }
 
@@ -469,10 +475,10 @@ async fn user_hooks_coexist_with_cancellation() {
     .await
     .unwrap();
 
-    isle.eval("local a = 1\nlocal b = 2").await.unwrap();
+    isle.eval::<()>("local a = 1\nlocal b = 2").await.unwrap();
     assert!(*lines.lock().unwrap() >= 2);
 
-    let task = isle.spawn_eval("coroutine.wrap(function() while true do end end)()");
+    let task = isle.spawn_eval::<()>("coroutine.wrap(function() while true do end end)()");
     tokio::time::sleep(Duration::from_millis(30)).await;
     task.cancel();
     assert!(matches!(
@@ -495,7 +501,7 @@ async fn a_hook_replaced_with_set_hook_is_restored_at_the_next_request() {
     .await
     .unwrap();
 
-    let task = isle.spawn_eval("coroutine.wrap(function() while true do end end)()");
+    let task = isle.spawn_eval::<()>("coroutine.wrap(function() while true do end end)()");
     tokio::time::sleep(Duration::from_millis(30)).await;
     task.cancel();
     assert!(matches!(
@@ -530,7 +536,7 @@ async fn readme_structured_tasks_example() {
 
     let r = within(
         2000,
-        isle.coroutine_eval(
+        isle.coroutine_eval::<String>(
             r#"
             local a = task.spawn(function() sleep(10) return "a" end)
             local b = task.spawn(function() error({ code = 42 }) end)

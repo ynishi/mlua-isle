@@ -16,7 +16,7 @@ communicating via channels.
   via a `Send + Sync` handle
 - **Cancellation** — long-running Lua code can be interrupted via `CancelToken`
   using a Lua debug hook
-- **Sync API** — blocking `Isle` handle with `Task` for non-blocking usage
+- **Sync API** — blocking `Isle` handle with `Task<T>` for non-blocking usage
 - **Async API** (optional, `tokio` feature) — `AsyncIsle` handle with
   Handle/Driver separation, bounded channel backpressure, and `AsyncTask<T>`
   which implements `Future`
@@ -132,6 +132,76 @@ driver.shutdown().await?;
 # }
 ```
 
+### Typed results and arguments
+
+A request converts its result on the VM thread and hands back a `Send`
+value of the type you ask for (`T: FromLuaMulti + Send + 'static`), so
+nothing is flattened to a string on the way:
+
+```rust
+use mlua_isle::Isle;
+
+let isle = Isle::spawn(|lua| {
+    lua.load("function info(n, flag, s) return n * 2, not flag, s end
+              function count(...) return select('#', ...) end").exec()
+}).unwrap();
+
+let n: i64 = isle.eval("return 1 + 1").unwrap();                // 2
+let pair: (i64, bool) = isle.eval("return 1, true").unwrap();   // several return values
+let none: Option<String> = isle.eval("return nil").unwrap();    // `nil` is `None`
+isle.eval::<()>("counter = 0").unwrap();                        // ignore the result
+
+// Arguments are `IntoLuaMulti`: a tuple keeps each value's Lua type.
+let (d, f, s): (i64, bool, String) = isle.call("info", (21, true, "x")).unwrap();
+assert_eq!((n, pair, none, d, f, s.as_str()), (2, (1, true), None, 42, false, "x"));
+
+// A run-time number of arguments: `Variadic` (a `Vec` is one argument, a table).
+let args = mlua::Variadic::from_iter(["a", "b"].map(String::from));
+let count: i64 = isle.call("count", args).unwrap();
+assert_eq!(count, 2);
+
+isle.shutdown().unwrap();
+```
+
+A value that does not convert is `IsleError::Lua` with kind
+`LuaErrorKind::Conversion`.  The conversions are mlua's own: a number
+converts to `String`, `bool` is Lua truthiness, and `mlua::BString` holds
+the raw bytes of a Lua string (UTF-8 or not).  A `FromLua` of your own
+that fails with an error raised by Lua code it runs is `IsleError::Lua`
+with that error's kind.  `Table`, `Function`, `Value` and `MultiValue`
+hold references into the VM and, without mlua's `send` feature, are not
+`Send`, so asking for them does not compile.  Convert them inside `exec`,
+whose closure returns any `T: Send + 'static` as is, or ask for a
+`mlua::RegistryKey` (which is `Send`) and read the value in a later
+`exec`:
+
+```rust
+use mlua_isle::Isle;
+
+let isle = Isle::spawn(|_| Ok(())).unwrap();
+let v: Vec<i64> = isle.exec(|lua| {
+    let t: mlua::Table = lua.load("return { 1, 2, 3 }").eval()?;
+    Ok(t.sequence_values::<i64>().collect::<mlua::Result<_>>()?)
+}).unwrap();
+assert_eq!(v, [1, 2, 3]);
+isle.shutdown().unwrap();
+```
+
+With the `serde` feature, a table deserializes the same way.  This is a
+fragment: `isle` is an `Isle` as above and `MyStruct` any type that
+implements `serde::Deserialize`:
+
+```rust
+use mlua::LuaSerdeExt;
+
+let s: MyStruct = isle.exec(|lua| {
+    Ok(lua.from_value(lua.load("return { name = 'x', n = 1 }").eval()?)?)
+}).unwrap();
+```
+
+The async handle has the same signatures (`isle.eval::<i64>(code).await`,
+`AsyncTask<T>`), and so do the coroutine requests.
+
 ### Coroutine execution (async)
 
 ```rust
@@ -149,12 +219,12 @@ let (isle, driver) = AsyncIsle::spawn(|lua| {
 }).await?;
 
 // Multiple coroutines share the same VM cooperatively
-let t1 = isle.spawn_coroutine_eval("sleep_ms(10) return 'a'");
-let t2 = isle.spawn_coroutine_eval("sleep_ms(10) return 'b'");
+let t1 = isle.spawn_coroutine_eval::<String>("sleep_ms(10) return 'a'");
+let t2 = isle.spawn_coroutine_eval::<String>("sleep_ms(10) return 'b'");
 
 let (r1, r2) = tokio::join!(t1, t2);
-assert!(r1.is_ok());
-assert!(r2.is_ok());
+assert_eq!(r1?, "a");
+assert_eq!(r2?, "b");
 
 driver.shutdown().await?;
 # Ok(())
@@ -195,7 +265,7 @@ use std::thread;
 
 let isle = Isle::spawn(|_| Ok(())).unwrap();
 
-let task = isle.spawn_eval("while true do end");
+let task = isle.spawn_eval::<()>("while true do end");
 
 thread::sleep(Duration::from_millis(50));
 task.cancel();
@@ -213,7 +283,7 @@ use mlua_isle::AsyncIsle;
 use std::time::Duration;
 
 let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await?;
-let task = isle.spawn_eval("while true do end");
+let task = isle.spawn_eval::<()>("while true do end");
 
 let token = task.cancel_token().clone();
 tokio::spawn(async move {
@@ -270,7 +340,7 @@ let (isle, driver) = AsyncIsle::spawn(|lua| {
 })
 .await?;
 
-let r = isle
+let r: String = isle
     .coroutine_eval(
         r#"
         local a = task.spawn(function() sleep(10) return "a" end)
@@ -303,7 +373,7 @@ requests, `Vm::run` / `run_root`):
 use mlua_isle::{Isle, IsleError, LuaErrorKind};
 
 let isle = Isle::spawn(|_| Ok(())).unwrap();
-match isle.eval("error({ code = 42 })") {
+match isle.eval::<String>("error({ code = 42 })") {
     Err(IsleError::Lua(f)) => {
         assert_eq!(f.kind, LuaErrorKind::Runtime);
         println!("{}", f.message);          // tostring(err), honours __tostring
@@ -423,12 +493,12 @@ returning.
 | Method | Description |
 |--------|-------------|
 | `Isle::spawn(init)` | Create a Lua VM on a dedicated thread |
-| `isle.eval(code)` | Evaluate a Lua chunk (blocking) |
-| `isle.call(func, args)` | Call a global Lua function (blocking) |
-| `isle.exec(closure)` | Run an arbitrary closure on the Lua thread |
-| `isle.spawn_eval(code)` | Non-blocking eval, returns a `Task` |
-| `isle.spawn_call(func, args)` | Non-blocking call, returns a `Task` |
-| `isle.spawn_exec(closure)` | Non-blocking exec, returns a `Task` |
+| `isle.eval::<T>(code)` | Evaluate a Lua chunk (blocking), result converted to `T` |
+| `isle.call::<A, T>(func, args)` | Call a global Lua function with `args: A` (blocking) |
+| `isle.exec(closure)` | Run an arbitrary closure on the Lua thread, returns its `T` |
+| `isle.spawn_eval::<T>(code)` | Non-blocking eval, returns a `Task<T>` |
+| `isle.spawn_call::<A, T>(func, args)` | Non-blocking call, returns a `Task<T>` |
+| `isle.spawn_exec(closure)` | Non-blocking exec, returns a `Task<T>` |
 | `isle.shutdown()` | Graceful shutdown and thread join |
 | `task.wait()` | Block until the task completes |
 | `task.cancel()` | Cancel the running task |
@@ -439,16 +509,16 @@ returning.
 |--------|-------------|
 | `AsyncIsle::spawn(init)` | Create a Lua VM, returns `(AsyncIsle, AsyncIsleDriver)` |
 | `AsyncIsle::builder()` | Configure channel capacity / thread name / `Config` |
-| `isle.eval(code)` | Evaluate a Lua chunk (async, exclusive) |
-| `isle.call(func, args)` | Call a global Lua function (async, exclusive) |
-| `isle.exec(closure)` | Run a closure on the Lua thread (async, exclusive) |
-| `isle.coroutine_eval(code)` | Evaluate as a cooperative coroutine |
-| `isle.coroutine_call(func, args)` | Call a function as a cooperative coroutine |
-| `isle.spawn_eval(code)` | Returns a cancellable `AsyncTask` |
-| `isle.spawn_call(func, args)` | Returns a cancellable `AsyncTask` |
-| `isle.spawn_exec(closure)` | Returns a cancellable `AsyncTask` |
-| `isle.spawn_coroutine_eval(code)` | Coroutine eval, returns `AsyncTask` |
-| `isle.spawn_coroutine_call(func, args)` | Coroutine call, returns `AsyncTask` |
+| `isle.eval::<T>(code)` | Evaluate a Lua chunk (async, exclusive), result converted to `T` |
+| `isle.call::<A, T>(func, args)` | Call a global Lua function with `args: A` (async, exclusive) |
+| `isle.exec(closure)` | Run a closure on the Lua thread (async, exclusive), returns its `T` |
+| `isle.coroutine_eval::<T>(code)` | Evaluate as a cooperative coroutine |
+| `isle.coroutine_call::<A, T>(func, args)` | Call a function as a cooperative coroutine |
+| `isle.spawn_eval::<T>(code)` | Returns a cancellable `AsyncTask<T>` |
+| `isle.spawn_call::<A, T>(func, args)` | Returns a cancellable `AsyncTask<T>` |
+| `isle.spawn_exec(closure)` | Returns a cancellable `AsyncTask<T>` |
+| `isle.spawn_coroutine_eval::<T>(code)` | Coroutine eval, returns `AsyncTask<T>` |
+| `isle.spawn_coroutine_call::<A, T>(func, args)` | Coroutine call, returns `AsyncTask<T>` |
 | `driver.shutdown().await` | Graceful shutdown (drains pending coroutines) |
 | `task.cancel()` | Cancel the running task |
 | `task.cancel_token()` | Access the `CancelToken` for sharing |

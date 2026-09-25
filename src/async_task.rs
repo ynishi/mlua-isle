@@ -24,10 +24,9 @@ use std::task::{Context, Poll};
 /// [`async_task::Task<T>`][async-task],
 /// [`async_std::task::JoinHandle<T>`][async-std-jh]).
 ///
-/// The default `T = String` matches the built-in `eval`/`call`/`exec`
-/// methods which return `String`.  The generic parameter allows
-/// downstream code to construct `AsyncTask<T>` with custom result
-/// types when wrapping or extending the API.
+/// `T` is the type the request converts its result to on the Lua
+/// thread: the `T` of [`AsyncIsle::eval`](crate::AsyncIsle::eval) and
+/// the other request methods.  There is no default.
 ///
 /// [tokio-jh]: https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html
 /// [async-task]: https://docs.rs/async-task/latest/async_task/struct.Task.html
@@ -45,7 +44,7 @@ use std::task::{Context, Poll};
 /// use std::time::Duration;
 ///
 /// let (isle, driver) = AsyncIsle::spawn(|_lua| Ok(())).await?;
-/// let task = isle.spawn_eval("while true do end");
+/// let task = isle.spawn_eval::<()>("while true do end");
 /// let token = task.cancel_token().clone();
 /// tokio::spawn(async move {
 ///     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -65,7 +64,7 @@ use std::task::{Context, Poll};
 /// `AbortOnDropHandle`.  Call [`detach`](AsyncTask::detach) to let it run
 /// to completion without keeping the handle.
 #[must_use = "dropping an AsyncTask cancels the operation; use `.detach()` to let it run"]
-pub struct AsyncTask<T = String> {
+pub struct AsyncTask<T> {
     rx: tokio::sync::oneshot::Receiver<Result<T, IsleError>>,
     cancel: CancelToken,
     /// Resolved or detached: dropping must not cancel.

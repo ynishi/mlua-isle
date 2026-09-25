@@ -28,7 +28,7 @@
 //!
 //! {
 //!     let isle = pool.checkout().unwrap();
-//!     assert_eq!(isle.eval("return greeting").unwrap(), "hello");
+//!     assert_eq!(isle.eval::<String>("return greeting").unwrap(), "hello");
 //! } // isle returned to pool
 //!
 //! pool.shutdown();

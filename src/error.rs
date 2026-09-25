@@ -22,7 +22,7 @@ use std::fmt;
 /// use mlua_isle::{Isle, IsleError, LuaErrorKind};
 ///
 /// let isle = Isle::spawn(|_| Ok(())).unwrap();
-/// match isle.eval("error('boom')") {
+/// match isle.eval::<()>("error('boom')") {
 ///     Err(IsleError::Lua(f)) => {
 ///         assert_eq!(f.kind, LuaErrorKind::Runtime);
 ///         assert!(f.message.ends_with("boom"));
