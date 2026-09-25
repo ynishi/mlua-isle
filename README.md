@@ -286,6 +286,32 @@ The isle owns the VM's Lua debug hook.  Register your own hook callbacks
 with `hooks::add_hook` rather than `Lua::set_hook`, which would replace
 the cancel hook.
 
+### Running Lua on a VM you own
+
+The actors are built on `runtime::Vm`, the in-thread layer.  A host that
+owns the `Lua` and drives its own `LocalSet` uses it directly: attach,
+put the `task` library where you want it, and run.  `Vm::attach`, the
+config and the hook methods need no feature; `vm.run`, `vm.task_lib`
+and `cancellable` need `tokio`.
+
+```rust
+use mlua_isle::runtime::{CancelToken, Config, Vm};
+use std::time::Duration;
+
+let vm = Vm::attach(&lua, Config { grace: Duration::from_secs(1), ..Default::default() })?;
+lua.globals().set("task", vm.task_lib()?)?;
+let out = local.run_until(vm.run(&token, main, ())).await?;
+```
+
+`vm.run` resolves only after every Lua task the root spawned has ended,
+and returns `Err(IsleError::Cancelled)` once `token` is cancelled (Ctrl-C,
+a timeout, a hook callback).  The `task` table is never set as a global
+by the crate.  `vm.config()` / `vm.set_config()` read and write the one
+`Config` of the VM, and `vm.add_hook` registers hook callbacks next to
+the cancel check.  An `AsyncIsle` takes the same `Config` through
+`AsyncIsle::builder().config(..)`; the pools have no such setting yet,
+so configure their VMs from the factory closure.
+
 ## API
 
 ### Sync (`Isle`)
@@ -308,7 +334,7 @@ the cancel hook.
 | Method | Description |
 |--------|-------------|
 | `AsyncIsle::spawn(init)` | Create a Lua VM, returns `(AsyncIsle, AsyncIsleDriver)` |
-| `AsyncIsle::builder()` | Configure channel capacity / thread name |
+| `AsyncIsle::builder()` | Configure channel capacity / thread name / `Config` |
 | `isle.eval(code)` | Evaluate a Lua chunk (async, exclusive) |
 | `isle.call(func, args)` | Call a global Lua function (async, exclusive) |
 | `isle.exec(closure)` | Run a closure on the Lua thread (async, exclusive) |
@@ -329,6 +355,9 @@ the cancel hook.
 | `cancellable(fut)` | Make an async host function stop at cancel |
 | `current_token()` | Token of the running request / task (derive child tokens) |
 | `run_root(lua, token, f, args)` | Run a coroutine with task support on a VM you drive |
+| `runtime::Vm::attach(lua, config)` | Take over a VM you own: hook, `Config`, `task` table |
+| `vm.task_lib()` | The `task` table, created on first call (not set as a global) |
+| `vm.run(&token, f, args)` | Run a root coroutine; resolves after its tasks ended |
 
 ### Pool (`IslePool`, `pool` feature)
 

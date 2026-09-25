@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+- `runtime` module, the in-thread layer: `runtime::Vm` is the entry point
+  for a host that owns the `Lua` and drives its own `LocalSet`.
+  `Vm::attach(&lua, Config)` installs the hook and stores the config (a
+  second `attach` on the same VM replaces the config); `Vm::of`,
+  `config` / `set_config`, `add_hook` / `remove_hook`, and with the
+  `tokio` feature `task_lib` (the `task` table, created on first call,
+  one per VM, never set as a global) and
+  `run(&token, f, args)`.  The module docs state the layer's contracts.
+  `runtime` also re-exports `CancelToken`, `current_token`, `HookId` and
+  `cancellable`.  The existing free functions are unchanged.
+- `runtime::Config` (`grace`, `preempt_every`), converting to and from
+  `hooks::CancelConfig`.
+- `AsyncIsleBuilder::config(Config)` sets the grace period and preemption
+  without the init closure.  It replaces a config the init closure set.
+
 ### Changed
 - The cancel grace period is now one deadline shared by a request or
   task and the tasks it spawns, transitively.  A task spawned during
@@ -9,6 +25,9 @@
   task that observes the cancel late still ends by its parent's
   deadline, so the total wait no longer grows with how deep cleanup
   spawns tasks or with the order in which tasks run.
+- `Isle`, `AsyncIsle` and the pools attach a `runtime::Vm` to their VM
+  after the init closure (in place of `hooks::install`) and run coroutine
+  requests through `Vm::run`.  No change in behaviour.
 
 ### Fixed
 - Cancelling a coroutine request, a `run_root` call or a task now waits
