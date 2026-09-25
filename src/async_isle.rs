@@ -139,6 +139,7 @@
 use crate::async_task::AsyncTask;
 use crate::error::IsleError;
 use crate::hook::CancelToken;
+use crate::runtime::Config;
 use crate::thread;
 use std::thread::JoinHandle;
 
@@ -286,6 +287,7 @@ pub struct AsyncIsleDriver {
 pub struct AsyncIsleBuilder {
     channel_capacity: usize,
     thread_name: String,
+    config: Option<Config>,
 }
 
 impl Default for AsyncIsleBuilder {
@@ -293,6 +295,7 @@ impl Default for AsyncIsleBuilder {
         Self {
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
             thread_name: "mlua-isle-async".into(),
+            config: None,
         }
     }
 }
@@ -317,6 +320,40 @@ impl AsyncIsleBuilder {
         self
     }
 
+    /// Set the VM's [`Config`] (cancel grace period and preemption).
+    ///
+    /// Applied when the VM is attached, after the init closure: it
+    /// replaces a config the init closure set (with
+    /// [`hooks::configure`](crate::hooks::configure) or
+    /// [`Vm::attach`](crate::runtime::Vm::attach)).  Without it, the VM
+    /// keeps what the init closure set, or the default.
+    ///
+    /// The pools have no such setting yet: configure their VMs from the
+    /// factory closure (`hooks::configure` or `Vm::attach`).
+    ///
+    /// ```rust
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use mlua_isle::runtime::Config;
+    /// use mlua_isle::AsyncIsle;
+    /// use std::time::Duration;
+    ///
+    /// let (isle, driver) = AsyncIsle::builder()
+    ///     .config(Config {
+    ///         grace: Duration::from_millis(100),
+    ///         preempt_every: Some(1),
+    ///     })
+    ///     .spawn(|_lua| Ok(()))
+    ///     .await?;
+    /// # driver.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn config(mut self, config: Config) -> Self {
+        self.config = Some(config);
+        self
+    }
+
     /// Spawn the Lua VM with the configured settings.
     ///
     /// See [`AsyncIsle::spawn`] for details.
@@ -324,7 +361,7 @@ impl AsyncIsleBuilder {
     where
         F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
     {
-        AsyncIsle::spawn_inner(init, self.channel_capacity, self.thread_name).await
+        AsyncIsle::spawn_inner(init, self.channel_capacity, self.thread_name, self.config).await
     }
 }
 
@@ -367,13 +404,20 @@ impl AsyncIsle {
     where
         F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
     {
-        Self::spawn_inner(init, DEFAULT_CHANNEL_CAPACITY, "mlua-isle-async".into()).await
+        Self::spawn_inner(
+            init,
+            DEFAULT_CHANNEL_CAPACITY,
+            "mlua-isle-async".into(),
+            None,
+        )
+        .await
     }
 
     async fn spawn_inner<F>(
         init: F,
         channel_capacity: usize,
         thread_name: String,
+        config: Option<Config>,
     ) -> Result<(Self, AsyncIsleDriver), IsleError>
     where
         F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
@@ -406,7 +450,7 @@ impl AsyncIsle {
                 let lua = mlua::Lua::new();
                 match init(&lua)
                     .map_err(|e| IsleError::Init(e.to_string()))
-                    .and_then(|()| crate::hooks::install(&lua))
+                    .and_then(|()| crate::runtime::attach_after_init(&lua, config).map(drop))
                 {
                     Ok(()) => {
                         let _ = init_tx.send(Ok(()));
@@ -791,7 +835,17 @@ fn run_async_loop(
     rt.block_on(local);
 }
 
-/// Execute Lua code as a coroutine request (see [`crate::run_root`]).
+/// The [`Vm`](crate::runtime::Vm) of the isle's VM (attached at spawn).
+fn vm(lua: &mlua::Lua) -> Result<crate::runtime::Vm, IsleError> {
+    match crate::runtime::Vm::of(lua) {
+        Some(vm) => Ok(vm),
+        // Unreachable: the isle attaches before reporting a successful
+        // spawn.  Kept as a defensive path.
+        None => crate::runtime::attach_after_init(lua, None),
+    }
+}
+
+/// Execute Lua code as a coroutine request (see [`Vm::run`](crate::runtime::Vm::run)).
 ///
 /// Cancellation is wired on two paths (see [`CancelToken`] docs):
 ///
@@ -814,7 +868,7 @@ async fn execute_coroutine_eval(
     cancel: &CancelToken,
 ) -> Result<String, IsleError> {
     let func = lua.load(code).into_function().map_err(IsleError::from)?;
-    let values = crate::scope::run_root(lua, cancel.clone(), func, mlua::MultiValue::new()).await?;
+    let values = vm(lua)?.run(cancel, func, ()).await?;
     thread::lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
 }
 
@@ -839,6 +893,6 @@ async fn execute_coroutine_call(
         .map_err(IsleError::from)?;
 
     let multi = mlua::MultiValue::from_vec(lua_args);
-    let values = crate::scope::run_root(lua, cancel.clone(), func, multi).await?;
+    let values = vm(lua)?.run(cancel, func, multi).await?;
     thread::lua_value_to_string(lua, values.into_iter().next().unwrap_or(mlua::Value::Nil))
 }

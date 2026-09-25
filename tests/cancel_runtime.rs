@@ -530,16 +530,16 @@ async fn readme_structured_tasks_example() {
 
 #[test]
 fn run_root_drives_tasks_on_a_vm_you_own() {
+    use mlua_isle::runtime::{Config, Vm};
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let lua = mlua::Lua::new();
-    hooks::install(&lua).unwrap();
-    lua.globals()
-        .set("task", tasks::install(&lua).unwrap())
-        .unwrap();
+    let vm = Vm::attach(&lua, Config::default()).unwrap();
+    lua.globals().set("task", vm.task_lib().unwrap()).unwrap();
     let f: mlua::Function = lua
         .load(
             "return function(x)
@@ -551,15 +551,8 @@ fn run_root_drives_tasks_on_a_vm_you_own() {
         .eval()
         .unwrap();
 
-    let out = local.block_on(&rt, async {
-        mlua_isle::run_root(
-            &lua,
-            CancelToken::new(),
-            f,
-            mlua::MultiValue::from_vec(vec![mlua::Value::Integer(21)]),
-        )
-        .await
-    });
+    let token = CancelToken::new();
+    let out = local.block_on(&rt, vm.run(&token, f, 21));
     let v: i64 = out
         .unwrap()
         .into_iter()

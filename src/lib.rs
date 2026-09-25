@@ -23,6 +23,24 @@
 //! └─────────────────┘           └──────────────────┘
 //! ```
 //!
+//! # Layers
+//!
+//! The crate has two layers:
+//!
+//! - **The actor layer** (crate root): [`Isle`], `AsyncIsle` and the
+//!   pools put a VM on a thread of their own; `Send` handles send
+//!   requests over channels.
+//! - **The in-thread layer** ([`runtime`]): for a host that owns the
+//!   [`mlua::Lua`] and drives the executor itself.
+//!   [`runtime::Vm`] owns the VM's debug hook, its
+//!   [`runtime::Config`] (cancel grace, preemption) and the `task`
+//!   library, and runs a root coroutine under a [`CancelToken`]
+//!   (`Vm::run`, `tokio` feature).
+//!
+//! The actors are built on [`runtime`]: each attaches a [`runtime::Vm`]
+//! to its VM, and a coroutine request is a `Vm::run`.  The contracts of
+//! the layer are stated in the [`runtime`] module docs.
+//!
 //! # Example
 //!
 //! ```rust
@@ -45,6 +63,7 @@ mod hook;
 pub mod hooks;
 #[cfg(feature = "pool")]
 mod pool;
+pub mod runtime;
 mod task;
 mod thread;
 

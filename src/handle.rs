@@ -53,7 +53,7 @@ impl Isle {
                 let lua = mlua::Lua::new();
                 match init(&lua)
                     .map_err(|e| IsleError::Init(e.to_string()))
-                    .and_then(|()| crate::hooks::install(&lua))
+                    .and_then(|()| crate::runtime::attach_after_init(&lua, None).map(drop))
                 {
                     Ok(()) => {
                         let _ = init_tx.send(Ok(()));
