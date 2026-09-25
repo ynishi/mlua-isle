@@ -377,6 +377,16 @@ where
 /// it yields; without
 /// [`CancelConfig::preempt_every`](crate::hooks::CancelConfig::preempt_every)
 /// the wait blocks on it.
+///
+/// # Dropping the future
+///
+/// Dropping the returned future before it resolves (wrapping it in
+/// [`tokio::time::timeout`], or a losing [`tokio::select!`] arm) drops
+/// the coroutine at once but only schedules the tasks it spawned for
+/// abort: tokio drops them on a later poll of the `LocalSet`, as with
+/// [`AbortHandle::abort`](tokio::task::AbortHandle::abort).  To have the
+/// tasks gone before you continue, [cancel](CancelToken::cancel) the
+/// token and await the future instead of dropping it.
 pub async fn run_root(
     lua: &Lua,
     token: CancelToken,

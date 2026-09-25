@@ -209,6 +209,12 @@ thread_local! {
 /// one being polled).  Use it to derive a [`child_token`](CancelToken::child_token)
 /// for work the host function starts, so that cancelling the request
 /// reaches that work too.  Returns `None` outside such a context.
+///
+/// Work started this way (a `spawn_local` of its own) is cancelled with
+/// the request, but the request does not wait for it before it
+/// resolves.  To have the request wait, do the work inside the future of
+/// a [`create_async_function`](mlua::Lua::create_async_function), so the
+/// coroutine awaits it.
 pub fn current_token() -> Option<CancelToken> {
     CURRENT.with(|c| c.borrow().clone())
 }

@@ -231,7 +231,11 @@ Call `.detach()` to let it run without keeping the handle.
 cancelling a request cancels every task it spawned (and theirs), and a
 request, whether it finishes or is cancelled, does not resolve before
 the tasks it did not join have been cancelled and have finished or been
-dropped.
+dropped.  The cancel grace period is one deadline for the request and
+all of its tasks.  Work a host function starts with its own
+`spawn_local` is not waited for; run it inside an async function's
+future instead.  Dropping a `run_root` future (rather than cancelling
+its token and awaiting it) only schedules its tasks for abort.
 
 ```rust
 # #[tokio::main]

@@ -33,6 +33,14 @@
 //! [`CancelConfig::preempt_every`](crate::hooks::CancelConfig::preempt_every)
 //! for that.  Cancelling from another thread (an [`AsyncTask`](crate::AsyncTask)
 //! handle) works without it.
+//!
+//! A host function that starts work of its own with
+//! [`current_token()`](crate::current_token)`.child_token()` and
+//! `spawn_local` gets cancellation, but the request does not wait for
+//! that work before it resolves.  To have the request wait, do the work
+//! inside the future of a
+//! [`create_async_function`](mlua::Lua::create_async_function), so the
+//! coroutine awaits it.
 
 use crate::scope::{self, FinishOnDrop, Outcome, TaskState, WRAP_PCALL};
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
