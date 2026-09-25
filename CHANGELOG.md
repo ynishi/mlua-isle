@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-25
+
 ### Breaking
 Typed errors (#11), per the API policy of #12: payloads change in place.
 
@@ -136,6 +138,17 @@ rejected at compile time (convert them inside `exec`, or ask for a
   cancel raises (caught with `pcall`, or received by a `__close`
   handler) and for `task.CANCELLED`.  `join` still returns
   `false, task.CANCELLED` for a cancelled task.
+- `impl From<IsleError> for mlua::Error`, so `?` works on an
+  `IsleError` inside an init closure or a host function
+  (`Vm::attach(lua, config)?` in an actor's init closure).
+  `IsleError::Cancelled` becomes `mlua::Error::external(Cancelled)`, so a
+  cancel stays a cancel (`task.is_cancelled(err)` in Lua,
+  `IsleError::Cancelled` back in Rust); any other variant becomes
+  `mlua::Error::external(e)` and comes back as `IsleError::Lua(f)` with
+  `f.message == e.to_string()` and `f.kind == Callback` (from a host
+  function) or `External` (from an init closure, as `Init(f)`).  An
+  `mlua::Error::external(IsleError::Cancelled)` built by hand is also
+  recognised as a cancel.
 - `serde` feature (`mlua/serialize` + `serde_json`): `LuaFailure::value`,
   the raised value as `serde_json::Value` when it converts.
 - `runtime` re-exports `IsleError`, `LuaFailure`, `LuaErrorKind` and
@@ -148,10 +161,10 @@ rejected at compile time (convert them inside `exec`, or ask for a
   `tokio` feature `task_lib` (the `task` table, created on first call,
   one per VM, never set as a global) and
   `run(&token, f, args)`.  The module docs state the layer's contracts.
-  `runtime` also re-exports `CancelToken`, `current_token`, `HookId` and
-  `cancellable`.  The existing free functions are unchanged.
-- `runtime::Config` (`grace`, `preempt_every`), converting to and from
-  `hooks::CancelConfig`.
+  `runtime` also exports `CancelToken`, `current_token`, `HookId` and
+  `cancellable`.  The 0.7 free functions forward to it (see Deprecated).
+- `runtime::Config` (`grace`, `preempt_every`), the settings of a VM.
+  `hooks::CancelConfig` is now a deprecated alias of it.
 - `AsyncIsleBuilder::config(Config)` sets the grace period and preemption
   without the init closure.  It replaces a config the init closure set.
 - Host tasks in a request's scope (#8): `runtime::current_scope()`
@@ -184,6 +197,41 @@ rejected at compile time (convert them inside `exec`, or ask for a
 - `Isle`, `AsyncIsle` and the pools attach a `runtime::Vm` to their VM
   after the init closure (in place of `hooks::install`) and run coroutine
   requests through `Vm::run`.  No change in behaviour.
+
+### Deprecated
+The 0.7 in-thread API moves to `runtime` (#13, per #12 rule 3: renames
+whose old name forwards).  Each old name below still compiles, warns,
+and forwards to its replacement; all of them are removed in the release
+after 0.8.0.  The forwards that attach the VM when it is not attached
+yet (`hooks::install`, `hooks::add_hook`, `tasks::install`, `run_root`)
+capture `xpcall` in doing so, and therefore fail on a VM whose globals
+were sandboxed before the first call.
+
+- `mlua_isle::run_root(lua, token, f, args)` → `runtime::Vm::attach(lua,
+  config)` once, then `vm.run(&token, f, args)`.  Forwards to `Vm::run`,
+  attaching the VM with its stored config first if needed.
+- `mlua_isle::cancellable` → `runtime::cancellable`.
+- `mlua_isle::current_token` → `runtime::current_token`.
+- `hooks::install(lua)` → `Vm::attach(lua, config)`.  Forwards to
+  `Vm::attach` with the stored config, so `Vm::of` returns the VM
+  afterwards.
+- `hooks::configure(lua, c)` / `hooks::config(lua)` → `vm.set_config(c)`
+  / `vm.config()`.  On a VM that is not attached yet they store / read
+  the config that the next attach keeps (they do not attach).
+- `hooks::add_hook(lua, t, f)` / `hooks::remove_hook(lua, id)` →
+  `vm.add_hook(t, f)` / `vm.remove_hook(id)`.  `add_hook` attaches the
+  VM first if needed and registers in the same hook as `Vm::add_hook`,
+  keeping 0.7's `Fn` callback semantics; `remove_hook` does not attach.
+- `hooks::CancelConfig` → `runtime::Config`.  Now a type alias of
+  `Config` (the `From` conversions between the two are gone; `.into()`
+  still compiles as the identity conversion).
+- `hooks::HookId` → `runtime::HookId` (the type is defined in `runtime`;
+  the old name is an alias).
+- `tasks::install(lua)` → `vm.task_lib()`.  Forwards to `Vm::task_lib`
+  (attaching the VM first if needed), so it returns the VM's one `task`
+  table: a second call returns the same table instead of a new one.
+- The `hooks` and `tasks` modules.  The hook and the Lua `task` library
+  are documented in the `runtime` module docs.
 
 ### Fixed
 - Cancelling a coroutine request, a `run_root` call or a task now waits

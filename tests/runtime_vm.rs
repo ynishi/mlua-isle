@@ -17,9 +17,6 @@ const B: Config = Config {
 fn of_is_none_before_attach_and_some_after() {
     let lua = mlua::Lua::new();
     assert!(Vm::of(&lua).is_none());
-    // Touching the hooks module alone does not attach.
-    mlua_isle::hooks::configure(&lua, A.into());
-    assert!(Vm::of(&lua).is_none());
 
     Vm::attach(&lua, A).unwrap();
     assert_eq!(Vm::of(&lua).unwrap().config(), A);
@@ -36,19 +33,6 @@ fn a_second_attach_wins_and_shares_the_state() {
 
     first.set_config(A);
     assert_eq!(second.config(), A);
-    assert_eq!(mlua_isle::hooks::config(&lua), A.into());
-}
-
-#[test]
-fn config_converts_to_and_from_cancel_config() {
-    let c: mlua_isle::hooks::CancelConfig = B.into();
-    assert_eq!(c.grace, B.grace);
-    assert_eq!(c.preempt_every, B.preempt_every);
-    assert_eq!(Config::from(c), B);
-    assert_eq!(
-        Config::default(),
-        Config::from(mlua_isle::hooks::CancelConfig::default())
-    );
 }
 
 #[test]
@@ -124,12 +108,12 @@ mod with_tokio {
         let lua = mlua::Lua::new();
         let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
         let c = calls.clone();
-        mlua_isle::hooks::add_hook(&lua, mlua::HookTriggers::EVERY_LINE, move |_, _| {
+        let vm = Vm::attach(&lua, A).unwrap();
+        vm.add_hook(mlua::HookTriggers::EVERY_LINE, move |_, _| {
             c.set(c.get() + 1);
             Ok(mlua::VmState::Continue)
         })
         .unwrap();
-        let vm = Vm::attach(&lua, A).unwrap();
         Vm::attach(&lua, B).unwrap();
         assert_eq!(calls.get(), 0, "attach ran Lua code");
         vm.task_lib().unwrap();
@@ -247,7 +231,7 @@ mod with_tokio {
         let (isle, driver) = AsyncIsle::builder()
             .config(B)
             .spawn(|lua| {
-                mlua_isle::hooks::configure(lua, A.into());
+                Vm::attach(lua, A)?;
                 Ok(())
             })
             .await
@@ -263,7 +247,7 @@ mod with_tokio {
     #[tokio::test]
     async fn without_builder_config_the_init_closures_config_is_kept() {
         let (isle, driver) = AsyncIsle::spawn(|lua| {
-            mlua_isle::hooks::configure(lua, A.into());
+            Vm::attach(lua, A)?;
             Ok(())
         })
         .await
@@ -279,8 +263,9 @@ mod with_tokio {
 
 #[test]
 fn an_isle_attaches_its_vm() {
+    // The init closure does not attach: the isle does.
     let isle = mlua_isle::Isle::spawn(|lua| {
-        mlua_isle::hooks::configure(lua, A.into());
+        assert!(Vm::of(lua).is_none());
         Ok(())
     })
     .unwrap();
@@ -288,9 +273,25 @@ fn an_isle_attaches_its_vm() {
         .exec(|lua| {
             let vm = Vm::of(lua).expect("attached");
             let task: mlua::Value = lua.globals().get("task")?;
-            Ok(format!("{:?} {}", vm.config() == A, task.is_nil()))
+            Ok(format!(
+                "{:?} {}",
+                vm.config() == Config::default(),
+                task.is_nil()
+            ))
         })
         .unwrap();
     assert_eq!(r, "true true");
+    isle.shutdown().unwrap();
+
+    // A config the init closure attached with is kept.
+    let isle = mlua_isle::Isle::spawn(|lua| {
+        Vm::attach(lua, A)?;
+        Ok(())
+    })
+    .unwrap();
+    let same = isle
+        .exec(|lua| Ok(Vm::of(lua).expect("attached").config() == A))
+        .unwrap();
+    assert!(same);
     isle.shutdown().unwrap();
 }

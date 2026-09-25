@@ -1,8 +1,8 @@
 #![cfg(feature = "tokio")]
 //! Structured tasks, hook sharing, two-stage cancel and handle drop.
 
-use mlua_isle::hooks::{self, CancelConfig};
-use mlua_isle::{cancellable, tasks, AsyncIsle, CancelToken, IsleError};
+use mlua_isle::runtime::{cancellable, Config, Vm};
+use mlua_isle::{AsyncIsle, CancelToken, IsleError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 /// Isle with `task`, `sleep(ms)` (cancellable), `hold(ms)` (not
 /// cancellable) and `probe(ms, name)` (records when its future drops).
 async fn isle_with(
-    config: CancelConfig,
+    config: Config,
     drops: Arc<Mutex<Vec<(String, Instant)>>>,
 ) -> (AsyncIsle, mlua_isle::AsyncIsleDriver) {
     AsyncIsle::spawn(move |lua| {
-        hooks::configure(lua, config);
-        lua.globals().set("task", tasks::install(lua)?)?;
+        let vm = Vm::attach(lua, config)?;
+        lua.globals().set("task", vm.task_lib()?)?;
         let sleep = lua.create_async_function(|_, ms: u64| {
             cancellable(async move {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -50,7 +50,7 @@ async fn isle_with(
 }
 
 async fn isle() -> (AsyncIsle, mlua_isle::AsyncIsleDriver) {
-    isle_with(CancelConfig::default(), Default::default()).await
+    isle_with(Config::default(), Default::default()).await
 }
 
 async fn within<F: std::future::Future>(ms: u64, f: F) -> F::Output {
@@ -204,7 +204,7 @@ async fn close_on_handle_cancels_and_waits() {
 #[tokio::test]
 async fn cancelling_the_request_reaches_grandchildren() {
     let drops = Arc::new(Mutex::new(Vec::new()));
-    let (isle, driver) = isle_with(CancelConfig::default(), drops.clone()).await;
+    let (isle, driver) = isle_with(Config::default(), drops.clone()).await;
     let task = isle.spawn_coroutine_eval::<()>(
         "task.spawn(function()
            task.spawn(function() probe(5000, 'grandchild') end)
@@ -246,7 +246,7 @@ async fn host_functions_can_derive_child_tokens() {
     let s = seen.clone();
     let (isle, driver) = AsyncIsle::spawn(move |lua| {
         let watch = lua.create_function(move |_, ()| {
-            let token = mlua_isle::current_token()
+            let token = mlua_isle::runtime::current_token()
                 .expect("no current token")
                 .child_token();
             let s = s.clone();
@@ -278,7 +278,7 @@ async fn host_functions_can_derive_child_tokens() {
 
 #[tokio::test]
 async fn preemption_lets_a_sibling_cancel_a_cpu_loop() {
-    let config = CancelConfig {
+    let config = Config {
         preempt_every: Some(1),
         ..Default::default()
     };
@@ -301,7 +301,7 @@ async fn preemption_lets_a_sibling_cancel_a_cpu_loop() {
 
 #[tokio::test]
 async fn preemption_does_not_yield_lua_created_coroutines() {
-    let config = CancelConfig {
+    let config = Config {
         preempt_every: Some(1),
         ..Default::default()
     };
@@ -329,7 +329,7 @@ async fn preemption_does_not_yield_lua_created_coroutines() {
 
 #[tokio::test]
 async fn preemption_interleaves_cpu_bound_requests() {
-    let config = CancelConfig {
+    let config = Config {
         preempt_every: Some(1),
         ..Default::default()
     };
@@ -354,7 +354,7 @@ async fn preemption_interleaves_cpu_bound_requests() {
 
 #[tokio::test]
 async fn grace_lets_close_handlers_await() {
-    let config = CancelConfig {
+    let config = Config {
         grace: Duration::from_millis(500),
         ..Default::default()
     };
@@ -401,7 +401,7 @@ async fn without_grace_an_awaiting_close_handler_cannot_finish() {
 
 #[tokio::test]
 async fn grace_ends_with_a_hard_drop() {
-    let config = CancelConfig {
+    let config = Config {
         grace: Duration::from_millis(100),
         ..Default::default()
     };
@@ -465,11 +465,11 @@ async fn user_hooks_coexist_with_cancellation() {
     let lines = Arc::new(Mutex::new(0u64));
     let l = lines.clone();
     let (isle, driver) = AsyncIsle::spawn(move |lua| {
-        hooks::add_hook(lua, mlua::HookTriggers::EVERY_LINE, move |_, _| {
+        let vm = Vm::attach(lua, Config::default())?;
+        vm.add_hook(mlua::HookTriggers::EVERY_LINE, move |_, _| {
             *l.lock().unwrap() += 1;
             Ok(mlua::VmState::Continue)
-        })
-        .map_err(mlua::Error::external)?;
+        })?;
         Ok(())
     })
     .await
@@ -515,14 +515,16 @@ async fn a_hook_replaced_with_set_hook_is_restored_at_the_next_request() {
 #[tokio::test]
 async fn readme_structured_tasks_example() {
     let (isle, driver) = AsyncIsle::spawn(|lua| {
-        hooks::configure(
+        let vm = Vm::attach(
             lua,
-            CancelConfig {
+            Config {
+                // A cancelled coroutine may run its cleanup for up to 100 ms.
                 grace: Duration::from_millis(100),
+                // Yield CPU-bound tasks so that siblings can run and cancel them.
                 preempt_every: Some(1),
             },
-        );
-        lua.globals().set("task", tasks::install(lua)?)?;
+        )?;
+        lua.globals().set("task", vm.task_lib()?)?;
         let sleep = lua.create_async_function(|_, ms: u64| {
             cancellable(async move {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -557,8 +559,6 @@ async fn readme_structured_tasks_example() {
 
 #[test]
 fn run_root_drives_tasks_on_a_vm_you_own() {
-    use mlua_isle::runtime::{Config, Vm};
-
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -589,9 +589,9 @@ fn run_root_drives_tasks_on_a_vm_you_own() {
     assert_eq!(v, 42);
 }
 
-// ── cancelling run_root waits for the tasks it spawned ──
+// ── cancelling Vm::run waits for the tasks it spawned ──
 
-/// Timeline of one cancelled [`mlua_isle::run_root`] call.
+/// Timeline of one cancelled `Vm::run` call.
 struct CancelledRoot {
     out: Result<mlua::MultiValue, IsleError>,
     cancelled_at: Instant,
@@ -602,8 +602,8 @@ struct CancelledRoot {
 }
 
 /// On a VM driven by its own current-thread runtime and `LocalSet`, run
-/// `src` under `run_root`, cancel it after 50 ms, and (when `second` is
-/// given) run `second` under a fresh `run_root` right after the first
+/// `src` under `Vm::run`, cancel it after 50 ms, and (when `second` is
+/// given) run `second` under a fresh `Vm::run` right after the first
 /// one resolved.
 ///
 /// `hsleep()` holds the host future for 1000 ms and is not
@@ -611,18 +611,15 @@ struct CancelledRoot {
 /// not cancellable either and logs nothing; `sleep(ms)` is
 /// `cancellable`.  `busy(ms)` blocks the thread without yielding.
 /// `mark()` records that the second root ran.
-fn cancel_run_root(config: CancelConfig, src: &str, second: Option<&str>) -> CancelledRoot {
+fn cancel_run_root(config: Config, src: &str, second: Option<&str>) -> CancelledRoot {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let local = tokio::task::LocalSet::new();
     let lua = mlua::Lua::new();
-    hooks::install(&lua).unwrap();
-    hooks::configure(&lua, config);
-    lua.globals()
-        .set("task", tasks::install(&lua).unwrap())
-        .unwrap();
+    let vm = Vm::attach(&lua, config).unwrap();
+    lua.globals().set("task", vm.task_lib().unwrap()).unwrap();
     let log: Arc<Mutex<Vec<(&'static str, Instant)>>> = Default::default();
 
     let l = log.clone();
@@ -687,12 +684,10 @@ fn cancel_run_root(config: CancelConfig, src: &str, second: Option<&str>) -> Can
             t.cancel();
             at
         });
-        let out = mlua_isle::run_root(&lua, token, f, mlua::MultiValue::new()).await;
+        let out = vm.run(&token, f, ()).await;
         let resolved_at = Instant::now();
         if let Some(g) = g {
-            mlua_isle::run_root(&lua, CancelToken::new(), g, mlua::MultiValue::new())
-                .await
-                .unwrap();
+            vm.run(&CancelToken::new(), g, ()).await.unwrap();
         }
         let cancelled_at = canceller.await.unwrap();
         CancelledRoot {
@@ -712,7 +707,7 @@ const GRANDCHILD: &str = "local c = task.spawn(function()
 const CHILD: &str = "local c = task.spawn(function() return hsleep() end)
      return c:join()";
 
-/// The `hsleep` future was dropped once, before `run_root` resolved;
+/// The `hsleep` future was dropped once, before `Vm::run` resolved;
 /// returns how long after the cancel.
 fn assert_dropped_before_resolve(r: &CancelledRoot) -> Duration {
     assert!(matches!(r.out.as_ref().unwrap_err(), &IsleError::Cancelled));
@@ -721,7 +716,7 @@ fn assert_dropped_before_resolve(r: &CancelledRoot) -> Duration {
     let drop_at = drops[0].1;
     assert!(
         drop_at <= r.resolved_at,
-        "run_root resolved {:?} before the host future was dropped",
+        "Vm::run resolved {:?} before the host future was dropped",
         drop_at.duration_since(r.resolved_at)
     );
     drop_at.duration_since(r.cancelled_at)
@@ -729,7 +724,7 @@ fn assert_dropped_before_resolve(r: &CancelledRoot) -> Duration {
 
 #[test]
 fn cancelling_run_root_waits_for_a_grandchild_to_drop() {
-    let r = cancel_run_root(CancelConfig::default(), GRANDCHILD, None);
+    let r = cancel_run_root(Config::default(), GRANDCHILD, None);
     let waited = assert_dropped_before_resolve(&r);
     assert!(
         waited < Duration::from_millis(500),
@@ -739,7 +734,7 @@ fn cancelling_run_root_waits_for_a_grandchild_to_drop() {
 
 #[test]
 fn cancelling_run_root_waits_for_a_child_to_drop() {
-    let r = cancel_run_root(CancelConfig::default(), CHILD, None);
+    let r = cancel_run_root(Config::default(), CHILD, None);
     let waited = assert_dropped_before_resolve(&r);
     assert!(
         waited < Duration::from_millis(500),
@@ -749,14 +744,14 @@ fn cancelling_run_root_waits_for_a_child_to_drop() {
 
 #[test]
 fn a_second_run_root_starts_after_the_first_ones_tasks_dropped() {
-    let r = cancel_run_root(CancelConfig::default(), GRANDCHILD, Some("mark()"));
+    let r = cancel_run_root(Config::default(), GRANDCHILD, Some("mark()"));
     let order: Vec<_> = r.log.iter().map(|(n, _)| *n).collect();
     assert_eq!(order, ["drop", "second"]);
 }
 
 #[test]
 fn cancelling_run_root_with_grace_still_waits_for_the_grandchild() {
-    let config = CancelConfig {
+    let config = Config {
         grace: Duration::from_millis(100),
         ..Default::default()
     };
@@ -796,7 +791,7 @@ const SPAWN_IN_NESTED_CLEANUP: &str =
      end })
      return sleep(5000)";
 
-const TREE_GRACE: CancelConfig = CancelConfig {
+const TREE_GRACE: Config = Config {
     grace: Duration::from_millis(200),
     preempt_every: None,
 };

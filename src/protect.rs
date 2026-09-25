@@ -127,7 +127,7 @@ fn install_inner(lua: &Lua) -> mlua::Result<Result<(), IsleError>> {
 pub(crate) type Parts = (Function, Function, Function);
 
 /// `(xpcall, handler, take)` of `lua`, installing them first if needed
-/// (a VM run with [`run_root`](crate::run_root) without `Vm::attach`).
+/// (defensive: every caller has attached the VM, which installs them).
 pub(crate) fn parts(lua: &Lua) -> Result<Parts, IsleError> {
     install(lua)?;
     let p = lua.app_data_ref::<Protect>().expect("installed just above");

@@ -38,8 +38,28 @@
 //!   (`Vm::run`, `tokio` feature).
 //!
 //! The actors are built on [`runtime`]: each attaches a [`runtime::Vm`]
-//! to its VM, and a coroutine request is a `Vm::run`.  The contracts of
-//! the layer are stated in the [`runtime`] module docs.
+//! to its VM, and a coroutine request is a `Vm::run`.  The [`runtime`]
+//! module docs are the canonical description of the in-thread layer:
+//! its contracts, the hook, and the Lua `task` library.
+//!
+//! # Moved to `runtime` in 0.8.0
+//!
+//! The in-thread API of 0.7 is deprecated; each old name forwards to
+//! its `runtime` replacement and will be removed in the release after
+//! 0.8.0.
+//!
+//! | 0.7 | 0.8 |
+//! |---|---|
+//! | `run_root(lua, token, f, args)` | [`Vm::attach`](runtime::Vm::attach) once, then `vm.run(&token, f, args)` |
+//! | `cancellable(fut)` (root) | `runtime::cancellable(fut)` |
+//! | `current_token()` (root) | [`runtime::current_token()`] |
+//! | `hooks::install(lua)` | [`Vm::attach(lua, config)`](runtime::Vm::attach) |
+//! | `hooks::configure` / `hooks::config` | [`Vm::set_config`](runtime::Vm::set_config) / [`Vm::config`](runtime::Vm::config) |
+//! | `hooks::add_hook` / `hooks::remove_hook` | [`Vm::add_hook`](runtime::Vm::add_hook) / [`Vm::remove_hook`](runtime::Vm::remove_hook) |
+//! | `hooks::CancelConfig` | [`runtime::Config`] (the old name is an alias) |
+//! | `hooks::HookId` | [`runtime::HookId`] |
+//! | `tasks::install(lua)` (`tokio`) | `Vm::attach(lua, config)?.task_lib()` (`tokio`) |
+//! | the `hooks` / `tasks` modules | [`runtime`] |
 //!
 //! # Example
 //!
@@ -60,7 +80,12 @@
 mod error;
 mod handle;
 mod hook;
+#[deprecated(
+    since = "0.8.0",
+    note = "use `mlua_isle::runtime` (`Vm`, `Config`, `HookId`)"
+)]
 pub mod hooks;
+mod hub;
 #[cfg(feature = "pool")]
 mod pool;
 mod protect;
@@ -77,13 +102,14 @@ mod async_task;
 #[cfg(feature = "tokio")]
 mod scope;
 #[cfg(feature = "tokio")]
+mod task_lib;
+#[cfg(feature = "tokio")]
+#[deprecated(since = "0.8.0", note = "use `mlua_isle::runtime::Vm::task_lib`")]
 pub mod tasks;
 
 pub use error::{Cancelled, IsleError, LuaErrorKind, LuaFailure};
 pub use handle::Isle;
-pub use hook::{current_token, CancelToken};
-#[cfg(feature = "tokio")]
-pub use scope::{cancellable, run_root};
+pub use hook::CancelToken;
 pub use task::Task;
 
 #[cfg(feature = "pool")]
@@ -95,6 +121,49 @@ pub use async_isle::{AsyncIsle, AsyncIsleBuilder, AsyncIsleDriver};
 pub use async_pool::{AsyncIslePool, AsyncPooledIsle};
 #[cfg(feature = "tokio")]
 pub use async_task::AsyncTask;
+
+/// Token of the request or task currently executing on this thread.
+/// Forwards to [`runtime::current_token`].
+#[deprecated(since = "0.8.0", note = "use `mlua_isle::runtime::current_token`")]
+pub fn current_token() -> Option<CancelToken> {
+    runtime::current_token()
+}
+
+/// Make an async host function's future stop when the calling request
+/// or task is cancelled.  Forwards to `runtime::cancellable`.
+#[cfg(feature = "tokio")]
+#[deprecated(since = "0.8.0", note = "use `mlua_isle::runtime::cancellable`")]
+pub async fn cancellable<F, T>(fut: F) -> mlua::Result<T>
+where
+    F: std::future::Future<Output = mlua::Result<T>>,
+{
+    runtime::cancellable(fut).await
+}
+
+/// Run `func(args)` as a root coroutine under `token`.  Forwards to
+/// [`Vm::run`](runtime::Vm::run) on the VM's [`Vm`](runtime::Vm),
+/// attaching it with its stored config first if it is not attached.
+///
+/// Migration: `Vm::attach(&lua, config)?` once, then
+/// `vm.run(&token, func, args).await`.
+///
+/// # Errors
+///
+/// As [`Vm::run`](runtime::Vm::run), plus the error of
+/// [`Vm::attach`](runtime::Vm::attach) when the VM was not attached.
+#[cfg(feature = "tokio")]
+#[deprecated(
+    since = "0.8.0",
+    note = "use `mlua_isle::runtime::Vm::attach` once, then `vm.run(&token, f, args)`"
+)]
+pub async fn run_root(
+    lua: &mlua::Lua,
+    token: CancelToken,
+    func: mlua::Function,
+    args: mlua::MultiValue,
+) -> Result<mlua::MultiValue, IsleError> {
+    runtime::of_or_attach(lua)?.run(&token, func, args).await
+}
 
 /// The work of one request, run on the VM thread.
 ///
