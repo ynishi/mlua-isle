@@ -152,7 +152,7 @@ pub fn install(lua: &Lua) -> mlua::Result<Table> {
             lua,
             token.clone(),
             grace,
-            scope.deadline(),
+            Some(scope.clone()),
             WRAP_PCALL,
             f,
             MultiValue::from_iter(args),

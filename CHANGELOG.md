@@ -5,8 +5,10 @@
 ### Changed
 - The cancel grace period is now one deadline shared by a request or
   task and the tasks it spawns, transitively.  A task spawned during
-  cleanup gets the remaining time instead of a fresh grace period, so
-  the total wait no longer grows with how deep cleanup spawns tasks.
+  cleanup gets the remaining time instead of a fresh grace period, and a
+  task that observes the cancel late still ends by its parent's
+  deadline, so the total wait no longer grows with how deep cleanup
+  spawns tasks or with the order in which tasks run.
 
 ### Fixed
 - Cancelling a coroutine request, a `run_root` call or a task now waits

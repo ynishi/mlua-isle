@@ -589,7 +589,8 @@ struct CancelledRoot {
 /// `hsleep()` holds the host future for 1000 ms and is not
 /// `cancellable`: only dropping its future releases it.  `hold(ms)` is
 /// not cancellable either and logs nothing; `sleep(ms)` is
-/// `cancellable`.  `mark()` records that the second root ran.
+/// `cancellable`.  `busy(ms)` blocks the thread without yielding.
+/// `mark()` records that the second root ran.
 fn cancel_run_root(config: CancelConfig, src: &str, second: Option<&str>) -> CancelledRoot {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -638,6 +639,13 @@ fn cancel_run_root(config: CancelConfig, src: &str, second: Option<&str>) -> Can
         })
         .unwrap();
     lua.globals().set("sleep", sleep).unwrap();
+    let busy = lua
+        .create_function(|_, ms: u64| {
+            std::thread::sleep(Duration::from_millis(ms));
+            Ok(())
+        })
+        .unwrap();
+    lua.globals().set("busy", busy).unwrap();
     let l = log.clone();
     let mark = lua
         .create_function(move |_, ()| {
@@ -790,6 +798,50 @@ fn the_grace_deadline_does_not_grow_with_depth() {
     let r = cancel_run_root(TREE_GRACE, SPAWN_IN_NESTED_CLEANUP, None);
     let waited = assert_dropped_before_resolve(&r);
     // A fresh grace per level would drop it at about cancel + 350 ms.
+    assert!(
+        waited >= Duration::from_millis(190) && waited < Duration::from_millis(260),
+        "dropped after {waited:?}"
+    );
+}
+
+/// Task `p` is waiting in `join` when the cancel comes, so it takes its
+/// deadline at once.  Its first task blocks the thread in cleanup, so its
+/// second task, holding a host future, observes the cancel late.
+const OBSERVE_AFTER_A_BLOCKING_SIBLING: &str = "local p = task.spawn(function()
+       local b = task.spawn(function()
+         local c <close> = setmetatable({}, { __close = function() busy(150) end })
+         return sleep(5000)
+       end)
+       local a = task.spawn(function() return hsleep() end)
+       return a:join()
+     end)
+     return p:join()";
+
+/// Task `p` finishes in the poll where it observes the cancel: its
+/// cleanup blocks the thread, so its task observes the cancel late.
+const OBSERVE_AFTER_THE_PARENT_FINISHED: &str = "local p = task.spawn(function()
+       local a = task.spawn(function() return hsleep() end)
+       local c <close> = setmetatable({}, { __close = function() busy(150) end })
+       return sleep(5000)
+     end)
+     return p:join()";
+
+#[test]
+fn a_task_that_observes_the_cancel_late_keeps_its_parents_deadline() {
+    let r = cancel_run_root(TREE_GRACE, OBSERVE_AFTER_A_BLOCKING_SIBLING, None);
+    let waited = assert_dropped_before_resolve(&r);
+    // A deadline taken when the task first runs after the cancel would
+    // be about cancel + 350 ms.
+    assert!(
+        waited >= Duration::from_millis(190) && waited < Duration::from_millis(260),
+        "dropped after {waited:?}"
+    );
+}
+
+#[test]
+fn a_parent_that_finishes_on_cancel_still_sets_the_deadline() {
+    let r = cancel_run_root(TREE_GRACE, OBSERVE_AFTER_THE_PARENT_FINISHED, None);
+    let waited = assert_dropped_before_resolve(&r);
     assert!(
         waited >= Duration::from_millis(190) && waited < Duration::from_millis(260),
         "dropped after {waited:?}"
