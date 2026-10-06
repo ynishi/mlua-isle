@@ -120,6 +120,10 @@
 //! | `task.select(cases, opts)` | Wait until one case is ready, take it, call its handler and return what the handler returns.  `opts.biased` (default `false`): check the cases in order instead of round robin.  `opts.default = f`: if no case is ready, call `f()` instead of waiting. |
 //! | `ch:arm_recv()`, `t:arm()` | A case for `task.select_raw`. |
 //! | `task.select_raw(arms, opts)` | As `task.select`, without handlers: returns the index of the chosen case and its values (`i, v, ok` for a receive, `i` for a timer).  `opts.default = true`: return `0` if no case is ready. |
+//! | `req.value`, `req:reply(v)`, `req:replied()`, `local req <close> = ...` | A `Request` received from a host channel.  See [Host channels and requests](#host-channels-and-requests). |
+//!
+//! A host channel (`channel`) is a `Channel` object like
+//! `task.channel`'s, receive-only: `send` / `try_send` raise.
 //!
 //! Tasks are **structured**: when a coroutine request or task finishes,
 //! the tasks it spawned and did not join are cancelled, and it waits
@@ -263,6 +267,101 @@
 //! A task waiting in a select (or any of these waits) is cancelled with
 //! its scope and ends within the grace like any other wait.
 //!
+//! # Host channels and requests
+//!
+//! `channel` (`tokio` feature) creates a channel that `Send` host
+//! code feeds into a running Lua loop: a `Sender` (`Send + Clone`)
+//! and its Lua side, a `LuaChannel` (the `task` library's `Channel`
+//! object).  A channel of `Request`s carries values that Lua answers:
+//!
+//! ```text
+//! let (tx, events) = channel::<Event>(&lua, 1024)?;      // on the VM thread
+//! lua.globals().set("events", events)?;
+//! tx.send(ev).await?;                                     // any thread or task
+//!
+//! let (req_tx, requests) = channel::<Request<Call, Answer>>(&lua, 256)?;
+//! lua.globals().set("requests", requests)?;
+//! let answer = tokio::time::timeout(limit, req_tx.request(call)).await??;
+//! ```
+//!
+//! ```lua
+//! task.select({
+//!   events:on(function(ev, ok) ... end),
+//!   requests:on(function(req, ok)
+//!     if ok then req:reply(answer_for(req.value)) end
+//!   end),
+//! })
+//! ```
+//!
+//! Call `channel` on the VM thread, after [`Vm::attach`] and
+//! `Vm::task_lib`; for an `AsyncIsle`, in an
+//! `exec` request that returns the `Sender` (example on `channel`).
+//!
+//! **Channel**
+//!
+//! - `cap >= 1` (a tokio bounded channel; `cap = 0` is an error, as for
+//!   local channels).  `ch:cap()` is `cap`; `ch:len()` counts the values
+//!   queued by the host plus any put back (below).
+//! - On the Lua side it behaves as a local channel: FIFO, any number of
+//!   Lua receivers, the same `recv` / `try_recv` / `close` / `closed` /
+//!   `len` / `cap` and the same `select` contract.  `send` / `try_send`
+//!   raise ("channel is receive-only").
+//! - A value is converted to a Lua value (`T: IntoLua`) when Lua takes
+//!   it, on the VM thread.  A conversion error is raised to the
+//!   receiver (`recv`, `try_recv`, `select`, `select_raw`), and that
+//!   value is dropped; the next receive takes the next value.
+//! - Closed when every `Sender` is dropped (receivers get the queued
+//!   values first, then `nil, false`), or when Lua calls `close`: the
+//!   host's sends then fail with the value given back (`SendError`,
+//!   `TrySendError::Closed`) and the values already queued can still
+//!   be received.  When the Lua side is collected (or the VM dropped),
+//!   the host's sends fail as closed.  `Sender::is_closed` reports
+//!   both.
+//! - Ordering between several `Sender`s is the order in which their
+//!   sends complete.
+//! - `Sender::send` waits while the channel is full;
+//!   `Sender::try_send` returns `TrySendError::Full`.  There is no
+//!   `send_timeout`: wrap `send` (or `request`) in
+//!   `tokio::time::timeout`; a send that times out sent nothing.
+//! - Several Lua receivers: every value is received exactly once, and no
+//!   receiver is left asleep while a value is queued, including when a
+//!   woken receiver's `select` chooses another case or the receiver is
+//!   cancelled.  (A tokio `Receiver` wakes only the task that polled it
+//!   last; the channel polls it with a waker that wakes every waiting
+//!   receiver.)
+//!
+//! **Request**
+//!
+//! - A `Request<Req, Resp>` carries a `Req` and a one-shot
+//!   reply.  `Sender::request` sends it and waits for the reply:
+//!   `RequestError::Closed` (with the `Req`) if the channel is closed,
+//!   `RequestError::NoReply` if the request is closed or collected
+//!   without a reply (or the `Req` failed to convert to a Lua value).
+//! - On the Lua side it is a userdata: `req.value` is the `Req`
+//!   (converted with `IntoLua` when Lua received it); `req:reply(v)`
+//!   converts `v` with `Resp: FromLua` and returns `true`, or `false`
+//!   when the requester stopped waiting (its future was dropped, e.g. by
+//!   a timeout; not an error).  A second `reply` raises, and so does a
+//!   `reply` after the request was closed.  A conversion error raises
+//!   and leaves the request unanswered: it can be answered again.
+//!   `req:replied()` is whether a `reply` succeeded.
+//! - Closing an unanswered request (`local req <close> = ...`, at scope
+//!   exit or on an error) answers `NoReply` at once.  A request that is
+//!   neither answered nor closed is reported `NoReply` only when Lua
+//!   collects it, so a requester should use a timeout, and Lua code that
+//!   may fail between receiving and replying should hold the request in
+//!   a `<close>` variable.
+//! - `select`'s handler form does not close a request its handler
+//!   returns without answering: the handler may hand it to a task that
+//!   replies later.  Close it in the handler (or let it be collected).
+//!
+//! **Delivery and cancellation** are as for local channels (above): a
+//! wait cancelled before it is ready consumed nothing, and a value
+//! `select` took for a handler that was never entered goes back to the
+//! front of the channel, ahead of the values the host queued (the Lua
+//! side keeps a front buffer for it; the tokio channel itself cannot
+//! take a value back).
+//!
 //! # Host tasks
 //!
 //! A host function that starts work of its own takes the scope of the
@@ -299,6 +398,10 @@ use std::time::Duration;
 
 pub use crate::error::{Cancelled, IsleError, LuaErrorKind, LuaFailure};
 pub use crate::hook::{current_token, CancelToken};
+#[cfg(feature = "tokio")]
+pub use crate::host_chan::{
+    channel, LuaChannel, Request, RequestError, SendError, Sender, TrySendError,
+};
 #[cfg(feature = "tokio")]
 pub use crate::scope::{cancellable, current_scope, ScopeHandle, ScopedTask};
 
@@ -357,7 +460,15 @@ struct Attached {
     /// does not) runs no extra Lua.  Kept in the registry, not as a
     /// global.
     #[cfg(feature = "tokio")]
-    task: std::cell::OnceCell<mlua::RegistryKey>,
+    task: std::cell::OnceCell<TaskLib>,
+}
+
+/// The registry keys of the `task` table and of the library's channel
+/// constructor (used by [`channel`]).
+#[cfg(feature = "tokio")]
+struct TaskLib {
+    table: mlua::RegistryKey,
+    wrap_channel: mlua::RegistryKey,
 }
 
 /// The in-thread handle of a Lua VM run by this crate.
@@ -533,13 +644,15 @@ impl Vm {
         }
         // Created without holding the app data borrow: the chunk runs
         // under the hook, whose callbacks may touch app data.
-        let key = self
-            .lua
-            .create_registry_value(crate::task_lib::create(&self.lua)?)?;
+        let (table, wrap_channel) = crate::task_lib::create(&self.lua)?;
+        let lib = TaskLib {
+            table: self.lua.create_registry_value(table)?,
+            wrap_channel: self.lua.create_registry_value(wrap_channel)?,
+        };
         {
             let a = self.attached();
-            // A table stored meanwhile wins; `key` is then dropped.
-            let _ = a.task.set(key);
+            // A table stored meanwhile wins; `lib` is then dropped.
+            let _ = a.task.set(lib);
         }
         Ok(self
             .cached_task_lib()?
@@ -550,7 +663,18 @@ impl Vm {
     fn cached_task_lib(&self) -> Result<Option<mlua::Table>, IsleError> {
         let a = self.attached();
         match a.task.get() {
-            Some(key) => Ok(Some(self.lua.registry_value(key)?)),
+            Some(lib) => Ok(Some(self.lua.registry_value(&lib.table)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The `task` library's channel constructor, if `Vm::task_lib`
+    /// created the library.
+    #[cfg(feature = "tokio")]
+    pub(crate) fn channel_ctor(&self) -> Result<Option<mlua::Function>, IsleError> {
+        let a = self.attached();
+        match a.task.get() {
+            Some(lib) => Ok(Some(self.lua.registry_value(&lib.wrap_channel)?)),
             None => Ok(None),
         }
     }

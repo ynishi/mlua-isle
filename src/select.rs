@@ -47,7 +47,7 @@ impl mlua::UserData for TimerUd {}
 
 /// One case of a select.
 pub(crate) enum Arm {
-    /// Receive from a local channel.
+    /// Receive from a channel (local or host).
     Recv(Chan),
     /// Wait for a timer.  The `Sleep` is created on the first poll that
     /// finds the timer not ready yet.
@@ -60,10 +60,15 @@ impl Arm {
     /// only when it returns `Ready`.
     ///
     /// Values: `v, true` (a value) or `nil, false` (closed and empty)
-    /// for a receive, none for a timer.
-    pub(crate) fn poll_take(&mut self, cx: &mut Context<'_>) -> Poll<mlua::Result<MultiValue>> {
+    /// for a receive, none for a timer.  A host value that fails to
+    /// convert is `Ready(Err)` (the value is dropped).
+    pub(crate) fn poll_take(
+        &mut self,
+        cx: &mut Context<'_>,
+        lua: &Lua,
+    ) -> Poll<mlua::Result<MultiValue>> {
         match self {
-            Arm::Recv(chan) => chan::poll_recv(chan, cx).map(|got| Ok(recv_values(got))),
+            Arm::Recv(chan) => chan::poll_recv(chan, cx, lua).map(|got| got.map(recv_values)),
             Arm::Timer(timer, sleep) => {
                 if Instant::now() >= timer.deadline {
                     return Poll::Ready(Ok(MultiValue::new()));
@@ -103,6 +108,8 @@ pub(crate) fn recv_values(got: Option<Value>) -> MultiValue {
 pub(crate) struct SelectFuture {
     pub(crate) arms: Vec<Arm>,
     pub(crate) start: usize,
+    /// The VM, for converting the values of host channels.
+    pub(crate) lua: Lua,
 }
 
 impl Future for SelectFuture {
@@ -111,9 +118,10 @@ impl Future for SelectFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let n = self.arms.len();
         let start = self.start;
+        let this = &mut *self;
         for k in 0..n {
             let i = (start + k) % n;
-            if let Poll::Ready(out) = self.arms[i].poll_take(cx) {
+            if let Poll::Ready(out) = this.arms[i].poll_take(cx, &this.lua) {
                 return Poll::Ready(out.map(|values| (i, values)));
             }
         }

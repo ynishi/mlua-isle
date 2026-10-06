@@ -11,12 +11,21 @@
 //! between the check and the registration cannot be missed, and a
 //! value is taken in the same poll that sees it (no other receiver can
 //! take it between a wake-up and the take).
+//!
+//! A **host channel** (`runtime::channel`) is the same `ChanCore` with
+//! a [`HostSource`]: the receiving end of a `tokio::sync::mpsc`
+//! channel that `Send` host code feeds.  A receive takes from `buf`
+//! first (where [`unrecv`] puts values back) and then from the source,
+//! so the receive arms of `select`, `Arm::untake` and the Lua `Channel`
+//! object work on it unchanged.
 
-use mlua::Value;
+use mlua::{IntoLua, Lua, Value};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
+use tokio::sync::mpsc;
 
 /// A local channel: the state behind a `task.channel` and the arms
 /// that receive from it.
@@ -31,6 +40,120 @@ pub(crate) struct ChanCore {
     recv_wakers: Vec<Waker>,
     /// Tasks waiting for room (or the close), in arrival order.
     send_wakers: Vec<Waker>,
+    /// The host end that feeds a host channel; `None` for a local
+    /// channel.  An `Rc` so that a receive can poll it (and convert the
+    /// value, which may run Lua code: an allocation can run a `__gc`)
+    /// without holding the borrow of the core.
+    source: Option<Rc<dyn HostSource>>,
+}
+
+/// The values of a host channel: the receiving end of the host's
+/// `tokio::sync::mpsc` channel, converting each value to a Lua value
+/// when it is taken (on the VM thread).
+pub(crate) trait HostSource {
+    /// Take the next value: `Ready(Ok(Some(v)))`, `Ready(Ok(None))` when
+    /// the channel is closed and drained, `Ready(Err(e))` when the value
+    /// failed to convert (the value is dropped).  Otherwise registers
+    /// the task and returns `Pending`.
+    fn poll_take(&self, cx: &mut Context<'_>, lua: &Lua) -> Poll<mlua::Result<Option<Value>>>;
+    /// Take the next value without waiting.
+    fn try_take(&self, lua: &Lua) -> mlua::Result<TryRecv>;
+    /// Close the channel: the host's sends fail from now on; queued
+    /// values can still be taken.
+    fn close(&self);
+    /// Whether the channel is closed (by `close` or because every host
+    /// sender was dropped).
+    fn is_closed(&self) -> bool;
+    /// How many values are queued.
+    fn len(&self) -> usize;
+    /// The capacity the channel was created with.
+    fn cap(&self) -> usize;
+}
+
+/// Wakes every task that waits on a host channel.
+///
+/// A tokio `Receiver` keeps a single receiver waker (an `AtomicWaker`,
+/// tokio `src/sync/mpsc/chan.rs`): each `poll_recv` replaces the
+/// waker of the previous one.  With several Lua receivers on one host
+/// channel, only the one that polled last would be woken, and if that
+/// one did not take the value (its `select` chose another case, or it
+/// was cancelled), the others would sleep with a value queued.  The
+/// receiver is therefore always polled with this waker, which wakes
+/// every task registered since the last wake-up; each re-polls, one
+/// takes the value and the rest register again.  `Send + Sync`: the
+/// host's senders wake it from other threads.
+#[derive(Default)]
+struct FanOut {
+    wakers: Mutex<Vec<Waker>>,
+}
+
+impl FanOut {
+    fn register(&self, waker: &Waker) {
+        let mut list = self.wakers.lock().unwrap_or_else(PoisonError::into_inner);
+        register(&mut list, waker);
+    }
+}
+
+impl Wake for FanOut {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let wakers =
+            std::mem::take(&mut *self.wakers.lock().unwrap_or_else(PoisonError::into_inner));
+        wake_all(wakers);
+    }
+}
+
+/// The [`HostSource`] over a `tokio::sync::mpsc::Receiver<T>`.
+struct HostRx<T> {
+    rx: RefCell<mpsc::Receiver<T>>,
+    fan: Arc<FanOut>,
+    /// `fan` as a [`Waker`], the one waker the receiver is polled with.
+    waker: Waker,
+}
+
+impl<T: IntoLua + 'static> HostSource for HostRx<T> {
+    fn poll_take(&self, cx: &mut Context<'_>, lua: &Lua) -> Poll<mlua::Result<Option<Value>>> {
+        // Register before polling, so that a value sent between the
+        // poll and the registration still wakes this task.
+        self.fan.register(cx.waker());
+        let got = self
+            .rx
+            .borrow_mut()
+            .poll_recv(&mut Context::from_waker(&self.waker));
+        match got {
+            Poll::Ready(Some(v)) => Poll::Ready(v.into_lua(lua).map(Some)),
+            Poll::Ready(None) => Poll::Ready(Ok(None)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn try_take(&self, lua: &Lua) -> mlua::Result<TryRecv> {
+        let got = self.rx.borrow_mut().try_recv();
+        match got {
+            Ok(v) => Ok(TryRecv::Value(v.into_lua(lua)?)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(TryRecv::Empty),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(TryRecv::Closed),
+        }
+    }
+
+    fn close(&self) {
+        self.rx.borrow_mut().close();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.rx.borrow().is_closed()
+    }
+
+    fn len(&self) -> usize {
+        self.rx.borrow().len()
+    }
+
+    fn cap(&self) -> usize {
+        self.rx.borrow().max_capacity()
+    }
 }
 
 /// The channel was closed.
@@ -74,41 +197,84 @@ pub(crate) fn new(cap: usize) -> Chan {
         closed: false,
         recv_wakers: Vec::new(),
         send_wakers: Vec::new(),
+        source: None,
     }))
 }
 
-/// Take the value at the front: `Ready(Some(v))`, or `Ready(None)` when
-/// the channel is closed and empty.  Otherwise registers the task and
-/// returns `Pending`.  Consumes only when it returns `Ready(Some)`.
-pub(crate) fn poll_recv(chan: &Chan, cx: &mut Context<'_>) -> Poll<Option<Value>> {
-    let mut c = chan.borrow_mut();
-    if let Some(v) = c.buf.pop_front() {
-        let wakers = std::mem::take(&mut c.send_wakers);
-        drop(c);
-        wake_all(wakers);
-        return Poll::Ready(Some(v));
-    }
-    if c.closed {
-        return Poll::Ready(None);
-    }
-    register(&mut c.recv_wakers, cx.waker());
-    Poll::Pending
+/// Create a host channel over `rx` (capacity `rx.max_capacity()`).
+pub(crate) fn new_host<T: IntoLua + 'static>(rx: mpsc::Receiver<T>) -> Chan {
+    let fan = Arc::new(FanOut::default());
+    let cap = rx.max_capacity();
+    let source = HostRx {
+        rx: RefCell::new(rx),
+        waker: Waker::from(fan.clone()),
+        fan,
+    };
+    Rc::new(RefCell::new(ChanCore {
+        buf: VecDeque::new(),
+        cap,
+        closed: false,
+        recv_wakers: Vec::new(),
+        send_wakers: Vec::new(),
+        source: Some(Rc::new(source)),
+    }))
 }
 
-/// Take the value at the front without waiting.
-pub(crate) fn try_recv(chan: &Chan) -> TryRecv {
+/// Whether `chan` is a host channel (receive-only on the Lua side).
+pub(crate) fn is_host(chan: &Chan) -> bool {
+    chan.borrow().source.is_some()
+}
+
+/// Take the value at the front: `Ready(Ok(Some(v)))`, or
+/// `Ready(Ok(None))` when the channel is closed and empty.  Otherwise
+/// registers the task and returns `Pending`.  Consumes only when it
+/// returns `Ready(Ok(Some))`, or `Ready(Err)`: a host value that failed
+/// to convert is dropped and the error returned.
+pub(crate) fn poll_recv(
+    chan: &Chan,
+    cx: &mut Context<'_>,
+    lua: &Lua,
+) -> Poll<mlua::Result<Option<Value>>> {
     let mut c = chan.borrow_mut();
     if let Some(v) = c.buf.pop_front() {
         let wakers = std::mem::take(&mut c.send_wakers);
         drop(c);
         wake_all(wakers);
-        return TryRecv::Value(v);
+        return Poll::Ready(Ok(Some(v)));
     }
-    if c.closed {
+    let Some(source) = c.source.clone() else {
+        if c.closed {
+            return Poll::Ready(Ok(None));
+        }
+        register(&mut c.recv_wakers, cx.waker());
+        return Poll::Pending;
+    };
+    // Host channel: also registered with the core, which `unrecv` and
+    // `close` wake.
+    register(&mut c.recv_wakers, cx.waker());
+    drop(c);
+    source.poll_take(cx, lua)
+}
+
+/// Take the value at the front without waiting.  Errs when a host
+/// value failed to convert (the value is dropped).
+pub(crate) fn try_recv(chan: &Chan, lua: &Lua) -> mlua::Result<TryRecv> {
+    let mut c = chan.borrow_mut();
+    if let Some(v) = c.buf.pop_front() {
+        let wakers = std::mem::take(&mut c.send_wakers);
+        drop(c);
+        wake_all(wakers);
+        return Ok(TryRecv::Value(v));
+    }
+    if let Some(source) = c.source.clone() {
+        drop(c);
+        return source.try_take(lua);
+    }
+    Ok(if c.closed {
         TryRecv::Closed
     } else {
         TryRecv::Empty
-    }
+    })
 }
 
 /// Put back a value that a receive took but could not hand over (see
@@ -166,12 +332,16 @@ pub(crate) fn try_send(chan: &Chan, v: Value) -> Result<bool, Closed> {
 }
 
 /// Close the channel and wake everyone waiting on it.  Idempotent.
+/// For a host channel, the host's sends fail from now on.
 pub(crate) fn close(chan: &Chan) {
     let mut c = chan.borrow_mut();
     if c.closed {
         return;
     }
     c.closed = true;
+    if let Some(source) = &c.source {
+        source.close();
+    }
     let mut wakers = std::mem::take(&mut c.recv_wakers);
     wakers.append(&mut c.send_wakers);
     drop(c);
@@ -179,15 +349,20 @@ pub(crate) fn close(chan: &Chan) {
 }
 
 pub(crate) fn is_closed(chan: &Chan) -> bool {
-    chan.borrow().closed
+    let c = chan.borrow();
+    c.closed || c.source.as_ref().is_some_and(|s| s.is_closed())
 }
 
+/// Values held: the front buffer plus, for a host channel, the values
+/// queued by the host.
 pub(crate) fn len(chan: &Chan) -> usize {
-    chan.borrow().buf.len()
+    let c = chan.borrow();
+    c.buf.len() + c.source.as_ref().map_or(0, |s| s.len())
 }
 
 pub(crate) fn cap(chan: &Chan) -> usize {
-    chan.borrow().cap
+    let c = chan.borrow();
+    c.source.as_ref().map_or(c.cap, |s| s.cap())
 }
 
 /// The Lua side of a channel: the userdata that the `task` library's
