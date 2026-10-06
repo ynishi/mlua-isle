@@ -379,7 +379,8 @@ pub(crate) fn lua_body(
     let root = Rc::new(Cell::new(None));
     let r = root.clone();
     let mark = lua.create_function(move |lua, ()| {
-        let ptr = lua.current_thread().to_pointer() as usize;
+        let ptr = hub::running_thread(lua)
+            .ok_or_else(|| mlua::Error::runtime("cannot read the running thread"))?;
         hub::mark_root(ptr);
         r.set(Some(ptr));
         Ok(())

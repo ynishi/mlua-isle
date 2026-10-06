@@ -169,8 +169,33 @@ fn dispatch(lua: &Lua, debug: &Debug, step: u32, cancel_every: u32) -> mlua::Res
 }
 
 fn is_root(lua: &Lua) -> bool {
-    let ptr = lua.current_thread().to_pointer() as usize;
-    ROOTS.with(|r| r.borrow().contains(&ptr))
+    match running_thread(lua) {
+        Some(ptr) => ROOTS.with(|r| r.borrow().contains(&ptr)),
+        None => false,
+    }
+}
+
+/// The address of the Lua thread that is actually running: the key of
+/// the root marks.
+///
+/// Not `Lua::current_thread`: for a coroutine that `Function::call_async`
+/// created it returns the owning thread instead (mlua 0.12,
+/// `Lua::current_thread`), and roots and tasks run in such coroutines, so
+/// every root and task (and any coroutine a host function runs with
+/// `call_async`) would share one key — a task finishing would unmark the
+/// root, and a host function's coroutine would count as a root.  Inside a
+/// hook or a callback, mlua sets the state it hands to `exec_raw` to the
+/// running thread.  `protect.rs` keys its handler entries by the running
+/// thread for the same reason.
+pub(crate) fn running_thread(lua: &Lua) -> Option<usize> {
+    let mut out = 0usize;
+    // SAFETY: the closure only reads the state pointer.
+    let r = unsafe {
+        lua.exec_raw::<()>((), |state| {
+            out = state as usize;
+        })
+    };
+    r.ok().map(|()| out)
 }
 
 /// Register a hook callback (see
