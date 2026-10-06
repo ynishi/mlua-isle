@@ -941,6 +941,7 @@ fn run_probed(
 
 /// Probe `src`, then run it with the cancel check aligned on the poll
 /// chunk's last instruction and the token cancelled just before it.
+/// `src` sets the global `after` right after the call under test.
 /// Asserts that the check landed there and that the run still ended
 /// as cancelled within the grace (the `while spin do end` loop after
 /// the call is cancelled at a later check).
@@ -960,13 +961,24 @@ fn run_with_cancel_in_poll_chunk(src: &str) -> Env {
         real.cancel_was_in_chunk.get(),
         "cancelled outside the chunk"
     );
-    assert!(
-        real.deferred_in_chunk.get(),
-        "the check at {} did not pass in the chunk with the token cancelled \
-         (raised there, or the chunk moved: it ended at {})",
-        target + pad,
-        real.target.get()
-    );
+    // The hub checks the cancel before it calls user callbacks, so when it
+    // raises at the aligned check this callback never sees that event (and
+    // counts one event short from there on).  Whether the statement after
+    // the call ran (`after`) tells a raise apart from a moved chunk.
+    if !real.deferred_in_chunk.get() {
+        let after = e.lua.globals().get::<bool>("after").unwrap_or(false);
+        assert!(
+            after,
+            "the cancel was raised at the check at {} in the poll chunk: the \
+             deferral did not apply",
+            target + pad
+        );
+        panic!(
+            "the check at {} did not run in the poll chunk with the token \
+             cancelled: the chunk moved",
+            target + pad
+        );
+    }
     assert_eq!(
         real.target.get(),
         target + pad,
@@ -986,6 +998,7 @@ fn a_cancel_in_the_poll_chunk_does_not_lose_the_value_recv_returned() {
          --PAD--
          arm()
          local v, ok = ch:recv()
+         after = true
          seen = tostring(v) .. ' ' .. tostring(ok)
          while spin do end",
     );
@@ -1002,6 +1015,7 @@ fn a_cancel_in_the_poll_chunk_does_not_lose_the_value_select_raw_returned() {
          --PAD--
          arm()
          local i, v, ok = task.select_raw(arms)
+         after = true
          seen = i .. ' ' .. tostring(v) .. ' ' .. tostring(ok)
          while spin do end",
     );
@@ -1017,6 +1031,7 @@ fn a_cancel_in_the_poll_chunk_lets_a_completed_send_return() {
          --PAD--
          arm()
          ch:send('y')
+         after = true
          sent = true
          while spin do end",
     );
