@@ -42,6 +42,11 @@ struct Hub {
     checks: Cell<u32>,
     /// Raw hook function of the main thread right after installation.
     installed: Cell<usize>,
+    /// Round-robin counter of `task.select` / `task.select_raw`: each
+    /// select that is not biased starts one position after the
+    /// previous one.
+    #[cfg(feature = "tokio")]
+    select_turn: Cell<usize>,
 }
 
 thread_local! {
@@ -218,6 +223,16 @@ pub(crate) fn set_config(lua: &Lua, config: Config) {
 /// The settings of a VM.
 pub(crate) fn config(lua: &Lua) -> Config {
     hub(lua).config.get()
+}
+
+/// Take the VM's next round-robin turn for a select (the caller reduces
+/// it modulo its number of cases).
+#[cfg(feature = "tokio")]
+pub(crate) fn next_select_turn(lua: &Lua) -> usize {
+    let hub = hub(lua);
+    let turn = hub.select_turn.get();
+    hub.select_turn.set(turn.wrapping_add(1));
+    turn
 }
 
 #[cfg(test)]
