@@ -121,7 +121,13 @@ end
 
 task.select_raw = select_raw
 
-return task
+-- The constructor `runtime::channel` wraps a host channel with: the
+-- same `Channel` object as `task.channel`.
+local function wrap_channel(c)
+  return setmetatable({ _c = c }, Channel)
+end
+
+return task, wrap_channel
 "#;
 
 #[derive(Default)]
@@ -140,10 +146,12 @@ impl Registry {
     }
 }
 
-/// Create the `task` library table for `lua`.  Called once per VM by
+/// Create the `task` library table for `lua`, and the function that
+/// wraps a channel userdata (`ChanUd`) in the library's `Channel`
+/// object (for `runtime::channel`).  Called once per VM by
 /// [`Vm::task_lib`](crate::runtime::Vm::task_lib), which documents the
 /// library.
-pub(crate) fn create(lua: &Lua) -> mlua::Result<Table> {
+pub(crate) fn create(lua: &Lua) -> mlua::Result<(Table, Function)> {
     let reg = Rc::new(Registry::default());
     let cancelled_marker = lua.create_table()?;
     cancelled_marker.set_metatable(Some(lua.create_table_from([(
@@ -248,6 +256,12 @@ fn closed_error(method: &str) -> mlua::Error {
     mlua::Error::runtime(format!("{method}: channel is closed"))
 }
 
+fn receive_only_error(method: &str) -> mlua::Error {
+    mlua::Error::runtime(format!(
+        "{method}: channel is receive-only (a host channel; the host sends)"
+    ))
+}
+
 /// The host functions under channels, timers and select, as the table
 /// `raw` that the library's Lua part reads.
 fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
@@ -279,6 +293,9 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
             let chan = select::chan_of(&ud);
             async move {
                 let chan = chan?;
+                if chan::is_host(&chan) {
+                    return Err(receive_only_error("ch:send"));
+                }
                 let mut slot = Some(v);
                 cancellable(async {
                     std::future::poll_fn(|cx| chan::poll_send(&chan, cx, &mut slot))
@@ -293,20 +310,22 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
     raw.set(
         "try_send",
         lua.create_function(|_, (ud, v): (AnyUserData, Value)| {
-            chan::try_send(&select::chan_of(&ud)?, v).map_err(|_| closed_error("ch:try_send"))
+            let chan = select::chan_of(&ud)?;
+            if chan::is_host(&chan) {
+                return Err(receive_only_error("ch:try_send"));
+            }
+            chan::try_send(&chan, v).map_err(|_| closed_error("ch:try_send"))
         })?,
     )?;
 
     raw.set(
         "recv",
-        lua.create_async_function(|_, ud: AnyUserData| {
+        lua.create_async_function(|lua, ud: AnyUserData| {
             let chan = select::chan_of(&ud);
             async move {
                 let chan = chan?;
-                let got = cancellable(async {
-                    Ok(std::future::poll_fn(|cx| chan::poll_recv(&chan, cx)).await)
-                })
-                .await?;
+                let got = cancellable(std::future::poll_fn(|cx| chan::poll_recv(&chan, cx, &lua)))
+                    .await?;
                 Ok(select::recv_values(got))
             }
         })?,
@@ -314,8 +333,8 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
 
     raw.set(
         "try_recv",
-        lua.create_function(|_, ud: AnyUserData| {
-            Ok(match chan::try_recv(&select::chan_of(&ud)?) {
+        lua.create_function(|lua, ud: AnyUserData| {
+            Ok(match chan::try_recv(&select::chan_of(&ud)?, lua)? {
                 chan::TryRecv::Value(v) => (v, true, true),
                 chan::TryRecv::Closed => (Value::Nil, false, true),
                 chan::TryRecv::Empty => (Value::Nil, false, false),
@@ -374,7 +393,11 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
                     start,
                     ..
                 } = cases?;
-                let mut sel = SelectFuture { arms, start };
+                let mut sel = SelectFuture {
+                    arms,
+                    start,
+                    lua: lua.clone(),
+                };
                 let (i, mut values) = match default {
                     DefaultCase::None => cancellable(&mut sel).await?,
                     _ => match sel.poll_now() {
@@ -404,7 +427,11 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
                     default,
                     start,
                 } = cases?;
-                let mut sel = SelectFuture { arms, start };
+                let mut sel = SelectFuture {
+                    arms,
+                    start,
+                    lua: lua.clone(),
+                };
                 let (i, values) = match default {
                     DefaultCase::Handler(f) => match sel.poll_now() {
                         Some(out) => out?,

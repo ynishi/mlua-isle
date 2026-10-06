@@ -102,6 +102,8 @@ mod async_task;
 #[cfg(feature = "tokio")]
 mod chan;
 #[cfg(feature = "tokio")]
+mod host_chan;
+#[cfg(feature = "tokio")]
 mod scope;
 #[cfg(feature = "tokio")]
 mod select;
