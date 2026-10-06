@@ -78,7 +78,9 @@
 //!
 //! 1. raises the cancellation error ([`Cancelled`]) when the token of
 //!    the request or task currently executing is cancelled (checked
-//!    every 1000 instructions),
+//!    every 1000 instructions; a check that lands in the code mlua uses
+//!    to return an async host function's results is deferred, see
+//!    [Channels, timers and select](#channels-timers-and-select)),
 //! 2. calls the callbacks registered with [`Vm::add_hook`], each at its
 //!    own [`HookTriggers`],
 //! 3. yields the running root coroutine or task every N checks when
@@ -105,6 +107,19 @@
 //! | `local h <close> = task.spawn(...)` | On scope exit, a task that was not joined is cancelled and waited for. |
 //! | `task.is_cancelled(err)` | Whether `err` is a cancellation: the error a cancel raises (caught with `pcall`, or received by a `__close` handler) or `task.CANCELLED`.  `false` for any other value. |
 //! | `task.CANCELLED` | What `join` returns as `err` for a cancelled task. |
+//! | `task.channel(cap)` | A local channel holding up to `cap` values (`cap >= 1`; `cap = 0` raises).  See [Channels, timers and select](#channels-timers-and-select). |
+//! | `ch:send(v)` | Push `v`; waits while the channel is full.  Raises when the channel is closed. |
+//! | `ch:try_send(v)` | Push `v` without waiting: `true`, or `false` when full.  Raises when the channel is closed. |
+//! | `ch:recv()` | Take the value at the front; waits while the channel is empty.  Returns `v, true`, or `nil, false` when the channel is closed and empty. |
+//! | `ch:try_recv()` | Take without waiting.  Returns `v, ok, ready`: `v, true, true` (a value), `nil, false, true` (closed and empty) or `nil, false, false` (empty, not closed). |
+//! | `ch:close()` | Close the channel.  Idempotent. |
+//! | `ch:closed()`, `ch:len()`, `ch:cap()` | Whether it is closed; how many values it holds; its capacity. |
+//! | `task.after(ms)` | A one-shot timer, ready `ms` milliseconds after this call (`ms <= 0`: at once) and from then on. |
+//! | `t:wait()` | Wait until the timer is ready. |
+//! | `ch:on(f)`, `t:on(f)` | A case for `task.select`: receive from `ch` and call `f(v, ok)`; or call `f()` when `t` is ready. |
+//! | `task.select(cases, opts)` | Wait until one case is ready, take it, call its handler and return what the handler returns.  `opts.biased` (default `false`): check the cases in order instead of round robin.  `opts.default = f`: if no case is ready, call `f()` instead of waiting. |
+//! | `ch:arm_recv()`, `t:arm()` | A case for `task.select_raw`. |
+//! | `task.select_raw(arms, opts)` | As `task.select`, without handlers: returns the index of the chosen case and its values (`i, v, ok` for a receive, `i` for a timer).  `opts.default = true`: return `0` if no case is ready. |
 //!
 //! Tasks are **structured**: when a coroutine request or task finishes,
 //! the tasks it spawned and did not join are cancelled, and it waits
@@ -144,6 +159,109 @@
 //! the same thread cannot run to cancel it; enable
 //! [`Config::preempt_every`] for that.  Cancelling from another thread
 //! (an `AsyncTask` handle) works without it.
+//!
+//! # Channels, timers and select
+//!
+//! The `task` library passes values between the tasks of one VM with
+//! **local channels**, and waits on several of them (and on timers) at
+//! once with **`select`**:
+//!
+//! ```lua
+//! local requests = task.channel(16)
+//! local worker = task.spawn(function()
+//!   while true do
+//!     local stop = task.select({
+//!       requests:on(function(req, ok)
+//!         if not ok then return true end   -- closed and drained
+//!         handle(req)
+//!         return false
+//!       end),
+//!       task.after(1000):on(function() idle() return false end),
+//!     })
+//!     if stop then return end
+//!   end
+//! end)
+//! requests:send(req)
+//! ```
+//!
+//! **Channels**
+//!
+//! - FIFO, with any number of senders and receivers inside one VM.
+//!   Waiting receivers are woken in arrival order.
+//! - Values are Lua values as they are (`nil` included); tables are
+//!   shared, not copied.
+//! - After `close`: `send` / `try_send` raise; `recv` returns what is
+//!   left, in order, then `nil, false`.
+//! - A channel belongs to no scope: cancelling a task does not close
+//!   it.  When the channel is garbage-collected, its contents are
+//!   dropped.  The values are held from Rust, out of the collector's
+//!   sight, so a value that refers back to its own channel keeps both
+//!   alive.
+//! - Without [`Config::preempt_every`], a sender that never waits (a
+//!   `try_send` loop) keeps receivers on the same thread from running;
+//!   `send`, which waits when the channel is full, is the form to use.
+//!
+//! **Timers**: `task.after(ms)` is ready once `ms` milliseconds have
+//! passed since it was created (`ms <= 0`: at once).  It may be waited
+//! on, or used as a case, any number of times; once ready it stays
+//! ready.
+//!
+//! **select**
+//!
+//! - Exactly one ready case is chosen.  Cases that are not chosen
+//!   consume nothing.
+//! - Order: round robin per VM by default (each select starts one
+//!   position after the previous one; deterministic, so tests are
+//!   reproducible).  `biased = true` checks the cases in the given
+//!   order.
+//! - `default`: if no case is ready on the first check, `select` runs
+//!   `default` (`select_raw` returns `0`) without waiting.
+//! - A closed, empty channel is ready: its case is chosen with
+//!   `ok = false`.  It stays ready, so a loop that keeps a closed
+//!   channel in its case list keeps selecting it.
+//! - An empty case list without `default` raises.
+//! - A handler runs as Lua code inside the select and may await (and
+//!   select again); an error it raises is re-raised by `select` with
+//!   its raw value.  While it runs, the other cases are not watched:
+//!   move long work into `task.spawn`.  [`Config::preempt_every`] does
+//!   not preempt a handler either: it runs in a coroutine that the
+//!   select's host call creates, not in a root or task (#22).
+//!
+//! **Delivery and cancellation**.  The cancel hook can raise at any
+//! instruction count check, including the instructions between a host
+//! function returning a value and the Lua code that uses it.  The
+//! library defines when a value is *delivered*:
+//!
+//! - A wait (`recv`, `send`, `t:wait()`, `select`, `select_raw`) that is
+//!   cancelled before it is ready returns the cancel error and has
+//!   consumed nothing (a cancelled `send` sent nothing).  The wait is
+//!   wrapped in `cancellable`, which checks the token first, so a poll
+//!   that returns the cancel never also polled the cases.
+//! - `recv` and `select_raw`: a value is delivered when the call returns
+//!   it.  A cancel raised after that, in the caller's code, is the
+//!   caller's to handle, as for any other value it holds.
+//! - `select`: a value is delivered when the chosen handler is entered
+//!   with it.  `select` takes the value and calls the handler inside the
+//!   same host call, so a cancel arrives either before the take
+//!   (nothing consumed) or inside the handler (the handler has the
+//!   value).  An error raised after the take but before the handler is
+//!   entered puts the value back at the front of its channel.
+//! - Between a host function's future becoming ready and the call
+//!   returning, mlua runs a few instructions of Lua code of its own (the
+//!   loop that polls the future).  The cancel hook does not raise there:
+//!   it raises at the next check outside that code (or the next
+//!   `cancellable` wait returns the cancel), so a value `recv` or
+//!   `select_raw` took reaches the caller, and a `send` that pushed its
+//!   value returns normally.  This holds for every async host function,
+//!   not only the library's.  A program that keeps landing its checks in
+//!   that code (an async host function that is always ready and not
+//!   `cancellable`, called in a tight loop) is still cancelled: the hook
+//!   defers at most 16 checks before it raises anyway.  The code is
+//!   recognised by its chunk name, which mlua keeps from 0.12.2 on (the
+//!   crate requires it).
+//!
+//! A task waiting in a select (or any of these waits) is cancelled with
+//! its scope and ends within the grace like any other wait.
 //!
 //! # Host tasks
 //!

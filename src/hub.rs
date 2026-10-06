@@ -24,6 +24,43 @@ use std::rc::Rc;
 /// Instruction interval of the cancel check.
 pub(crate) const CANCEL_CHECK_INTERVAL: u32 = 1000;
 
+/// Chunk name of the Lua code through which mlua runs every async host
+/// function (`RawLua::create_async_callback`, mlua 0.12.2
+/// `src/state/raw.rs:1624-1667`).  The function that chunk returns
+/// polls the host future and, once the future is ready, returns its
+/// results with a few more instructions of its own.
+///
+/// mlua sets the name before `try_cache()` (`src/state/raw.rs:1665-1666`;
+/// `Chunk::compile` compiles with it, `src/chunk.rs:678-680`), so the
+/// name is the source of that function, and mlua recognises it the same
+/// way (`RawLua::is_async_wrapper_yield`, `src/state/raw.rs:1671-1678`).
+/// Requires mlua 0.12.2: in 0.12.1 the cache dropped the name.
+const ASYNC_POLL_CHUNK: &str = "=__mlua_async_poll";
+
+/// How many cancel checks may be deferred because they landed in mlua's
+/// async poll chunk before the cancel is raised anyway (the count is
+/// reset when a cancel is raised).  Bounds the delay for a loop whose
+/// checks keep landing there (an async host function that is always
+/// ready and not `cancellable`, called in a loop whose length divides
+/// the check interval).
+const MAX_DEFERRED: u32 = 16;
+
+/// Whether the hook fired in mlua's async poll chunk.
+///
+/// A cancel raised there, after the host future returned its values and
+/// before the chunk returned them, would lose those values (a value
+/// `recv` took from a channel) or report a failure for work that was
+/// done (a `send` that pushed its value).  The cancel is raised at a
+/// later check instead: the next one outside the chunk, or at the next
+/// `cancellable` await.  Before the future is ready, deferring changes
+/// nothing: a `cancellable` future returns the cancel itself.
+///
+/// Recognised by the source of the running function
+/// ([`ASYNC_POLL_CHUNK`]).
+fn in_async_poll(debug: &Debug) -> bool {
+    debug.source().source.as_deref() == Some(ASYNC_POLL_CHUNK)
+}
+
 type Callback = dyn Fn(&Lua, &Debug) -> mlua::Result<VmState>;
 
 struct Entry {
@@ -40,8 +77,16 @@ struct Hub {
     next_id: Cell<u64>,
     config: Cell<Config>,
     checks: Cell<u32>,
+    /// Cancel checks deferred because they landed in mlua's async poll
+    /// chunk (see [`in_async_poll`]).  Reset when a cancel is raised.
+    deferred: Cell<u32>,
     /// Raw hook function of the main thread right after installation.
     installed: Cell<usize>,
+    /// Round-robin counter of `task.select` / `task.select_raw`: each
+    /// select that is not biased starts one position after the
+    /// previous one.
+    #[cfg(feature = "tokio")]
+    select_turn: Cell<usize>,
 }
 
 thread_local! {
@@ -123,7 +168,14 @@ fn dispatch(lua: &Lua, debug: &Debug, step: u32, cancel_every: u32) -> mlua::Res
         hub.checks.set(checks);
         if checks.is_multiple_of(cancel_every) {
             if hook::current_is_cancelled() {
-                return Err(crate::error::cancel_error());
+                // Only on the cancelled path: the source lookup costs a
+                // `lua_getinfo`.
+                if hub.deferred.get() < MAX_DEFERRED && in_async_poll(debug) {
+                    hub.deferred.set(hub.deferred.get() + 1);
+                } else {
+                    hub.deferred.set(0);
+                    return Err(crate::error::cancel_error());
+                }
             }
             if let Some(n) = hub.config.get().preempt_every {
                 if (checks / cancel_every).is_multiple_of(n.max(1)) && is_root(lua) {
@@ -245,6 +297,16 @@ pub(crate) fn config(lua: &Lua) -> Config {
     hub(lua).config.get()
 }
 
+/// Take the VM's next round-robin turn for a select (the caller reduces
+/// it modulo its number of cases).
+#[cfg(feature = "tokio")]
+pub(crate) fn next_select_turn(lua: &Lua) -> usize {
+    let hub = hub(lua);
+    let turn = hub.select_turn.get();
+    hub.select_turn.set(turn.wrapping_add(1));
+    turn
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +418,35 @@ mod tests {
         assert!(remove_hook(&lua, id).unwrap());
         assert!(!remove_hook(&lua, id).unwrap());
         lua.load("local x = 1").exec().unwrap();
+    }
+
+    /// A cancel check that lands in a chunk named like mlua's async poll
+    /// chunk is deferred, but only `MAX_DEFERRED` times: a loop there is
+    /// still cancelled.
+    #[test]
+    fn cancel_in_the_async_poll_chunk_is_deferred_but_not_forever() {
+        let lua = Lua::new();
+        install(&lua).unwrap();
+        let token = CancelToken::new();
+        token.cancel();
+        let _enter = EnterGuard::new(&token);
+        let counting = "local n = 0 for i = 1, 3000 do n = n + 1 end return n";
+        let counted: i64 = lua
+            .load(counting)
+            .set_name(ASYNC_POLL_CHUNK)
+            .eval()
+            .unwrap();
+        assert_eq!(counted, 3000);
+        assert!(hub(&lua).deferred.get() > 0);
+        assert_cancelled(
+            lua.load("while true do end")
+                .set_name(ASYNC_POLL_CHUNK)
+                .exec(),
+        );
+        assert_eq!(hub(&lua).deferred.get(), 0);
+        // Any other chunk is cancelled at the first check.
+        assert_cancelled(lua.load(counting).set_name("=other").exec());
+        assert_eq!(hub(&lua).deferred.get(), 0);
     }
 
     #[test]

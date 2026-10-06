@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added
+- `task` library (`tokio` feature): local channels, one-shot timers and
+  `select` (#20, part 1 of #19).  `task.channel(cap)` (`cap >= 1`) with
+  `send` / `try_send` / `recv` / `try_recv` / `close` / `closed` / `len` /
+  `cap`; `task.after(ms)` with `wait`; `task.select(cases, opts)` (handler
+  form, built with `ch:on(f)` / `t:on(f)`) and `task.select_raw(arms, opts)`
+  (built with `ch:arm_recv()` / `t:arm()`), with `biased`, `default` and
+  round robin per VM.  `select` calls the chosen handler inside its own
+  host call, so a value it takes is either left in the channel or handed
+  to the handler.  Contracts in the `runtime` module docs ("Channels,
+  timers and select").
+
+### Changed
+- The cancel hook no longer raises a cancel while mlua runs the Lua code
+  that returns an async host function's results (its async poll chunk);
+  it raises it at the next check outside that code (and after at most 16
+  deferred checks regardless).  A value that `ch:recv` / `task.select_raw`
+  (or any async host function) returned therefore reaches the caller, and
+  a `ch:send` that pushed its value returns normally, when a cancel
+  arrives at that moment.  The chunk is recognised by its source name,
+  `=__mlua_async_poll`, which mlua keeps from 0.12.2 on.
+- Requires mlua 0.12.2 or later (was 0.12): in 0.12.1 the async poll
+  chunk loses its name, so the deferral above would not apply.
+
 ### Fixed
 - Preemption (`Config::preempt_every`) keys its root marks by the Lua
   thread that is actually running.  They were keyed by

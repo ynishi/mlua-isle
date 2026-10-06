@@ -100,7 +100,11 @@ mod async_pool;
 #[cfg(feature = "tokio")]
 mod async_task;
 #[cfg(feature = "tokio")]
+mod chan;
+#[cfg(feature = "tokio")]
 mod scope;
+#[cfg(feature = "tokio")]
+mod select;
 #[cfg(feature = "tokio")]
 mod task_lib;
 #[cfg(feature = "tokio")]
