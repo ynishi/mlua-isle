@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+- `task` library (`tokio` feature): local channels, one-shot timers and
+  `select` (#20, part 1 of #19).  `task.channel(cap)` (`cap >= 1`) with
+  `send` / `try_send` / `recv` / `try_recv` / `close` / `closed` / `len` /
+  `cap`; `task.after(ms)` with `wait`; `task.select(cases, opts)` (handler
+  form, built with `ch:on(f)` / `t:on(f)`) and `task.select_raw(arms, opts)`
+  (built with `ch:arm_recv()` / `t:arm()`), with `biased`, `default` and
+  round robin per VM.  `select` calls the chosen handler inside its own
+  host call, so a value it takes is either left in the channel or handed
+  to the handler.  Contracts in the `runtime` module docs ("Channels,
+  timers and select").
+
 ## [0.8.0] - 2026-09-25
 
 ### Breaking
