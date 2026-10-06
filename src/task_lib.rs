@@ -2,13 +2,14 @@
 //! it.  Crate-internal; documented in the [`runtime`](crate::runtime)
 //! module docs ("The `task` library").
 
-use crate::chan::{self, ChanUd};
-use crate::scope::{self, cancellable, Spawned, Wrap};
+use crate::chan::{self, Chan, ChanUd, Receiving, Sending};
+use crate::scope::{self, cancellable, ScopedTask, Spawned, Wrap};
 use crate::select::{self, Cases, DefaultCase, SelectFuture, Timer, TimerUd};
 use mlua::{AnyUserData, Function, Lua, MultiValue, Table, Value, Variadic};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 const LIB: &str = r#"
 local spawn_raw, join_raw, cancel_raw, done_raw, release_raw, is_cancel_error, CANCELLED, raw = ...
@@ -59,10 +60,27 @@ local chan_raw, send_raw, try_send_raw = raw.chan, raw.send, raw.try_send
 local recv_raw, try_recv_raw, close_raw = raw.recv, raw.try_recv, raw.close
 local closed_raw, len_raw, cap_raw = raw.closed, raw.len, raw.cap
 local after_raw, wait_raw = raw.after, raw.wait
+local ticker_raw, stop_raw, task_case_raw = raw.ticker, raw.stop, raw.task_case
 local select_handlers, select_raw = raw.select, raw.select_raw
 
 local function check_handler(f)
   if type(f) ~= "function" then error("handler must be a function", 3) end
+end
+
+-- The case of a task handle: what `join` would return, once the task
+-- has finished.  Choosing it marks the handle joined.
+local function task_case(self, f)
+  if self._joined then error("task already joined", 3) end
+  return { kind = "task", target = task_case_raw(self._id), handle = self, handler = f }
+end
+
+function Task:on(f)
+  check_handler(f)
+  return task_case(self, f)
+end
+
+function Task:arm()
+  return task_case(self)
 end
 
 local Channel = {}
@@ -86,6 +104,21 @@ function Channel:arm_recv()
   return { kind = "recv", target = self._c }
 end
 
+function Channel:on_send(v, f)
+  check_handler(f)
+  return { kind = "send", target = self._c, value = v, handler = f }
+end
+
+function Channel:arm_send(v)
+  return { kind = "send", target = self._c, value = v }
+end
+
+-- A ticker is a `Channel` (receive-only) with `stop`.
+local Ticker = setmetatable({}, { __index = Channel })
+Ticker.__index = Ticker
+
+function Ticker:stop() stop_raw(self._tk) end
+
 local Timer = {}
 Timer.__index = Timer
 
@@ -106,6 +139,11 @@ end
 
 function task.after(ms)
   return setmetatable({ _t = after_raw(ms) }, Timer)
+end
+
+function task.ticker(ms)
+  local c, t = ticker_raw(ms)
+  return setmetatable({ _c = c, _tk = t }, Ticker)
 end
 
 -- The host function calls the handler under `pcall` and returns
@@ -130,19 +168,70 @@ end
 return task, wrap_channel
 "#;
 
-#[derive(Default)]
-struct Registry {
+/// The tasks started with `task.spawn` that were not joined yet, by
+/// the id their Lua handle holds.
+pub(crate) struct Registry {
     tasks: RefCell<HashMap<u64, Spawned<MultiValue>>>,
     next_id: Cell<u64>,
+    /// `task.CANCELLED`.
+    cancelled: Table,
 }
 
 impl Registry {
-    fn get(&self, id: u64) -> mlua::Result<Spawned<MultiValue>> {
+    pub(crate) fn get(&self, id: u64) -> mlua::Result<Spawned<MultiValue>> {
         self.tasks
             .borrow()
             .get(&id)
             .cloned()
             .ok_or_else(|| mlua::Error::runtime("unknown task"))
+    }
+
+    /// Forget a task that was joined.
+    pub(crate) fn forget(&self, id: u64) {
+        self.tasks.borrow_mut().remove(&id);
+    }
+
+    /// Take back a task whose join was undone.
+    pub(crate) fn restore(&self, id: u64, task: Spawned<MultiValue>) {
+        self.tasks.borrow_mut().insert(id, task);
+    }
+
+    /// What `join` returns for a cancelled task: `false, task.CANCELLED`.
+    pub(crate) fn cancelled_values(&self) -> MultiValue {
+        MultiValue::from_vec(vec![
+            Value::Boolean(false),
+            Value::Table(self.cancelled.clone()),
+        ])
+    }
+}
+
+/// The target of a task case (`h:on(f)` / `h:arm()`): the task behind a
+/// handle.
+pub(crate) struct TaskUd {
+    pub(crate) id: u64,
+    pub(crate) reg: Rc<Registry>,
+}
+
+impl mlua::UserData for TaskUd {}
+
+/// The host side of a ticker (`tk._tk`): the host task that feeds its
+/// channel.  Dropping it (`stop`, or when the ticker is collected)
+/// cancels the task.
+struct TickerUd {
+    task: RefCell<Option<ScopedTask<()>>>,
+    chan: Chan,
+}
+
+impl mlua::UserData for TickerUd {}
+
+/// Closes a ticker's channel when its host task ends, however it ends
+/// (stopped, cancelled with its scope, or dropped at the end of the
+/// grace).
+struct CloseOnDrop(Chan);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        chan::close(&self.0);
     }
 }
 
@@ -152,12 +241,16 @@ impl Registry {
 /// [`Vm::task_lib`](crate::runtime::Vm::task_lib), which documents the
 /// library.
 pub(crate) fn create(lua: &Lua) -> mlua::Result<(Table, Function)> {
-    let reg = Rc::new(Registry::default());
     let cancelled_marker = lua.create_table()?;
     cancelled_marker.set_metatable(Some(lua.create_table_from([(
         "__tostring",
         lua.create_function(|_, _: Value| Ok("task.CANCELLED"))?,
     )])?))?;
+    let reg = Rc::new(Registry {
+        tasks: RefCell::new(HashMap::new()),
+        next_id: Cell::new(0),
+        cancelled: cancelled_marker.clone(),
+    });
 
     let r = reg.clone();
     let spawn_raw = lua.create_function(move |lua, (f, args): (Function, Variadic<Value>)| {
@@ -196,18 +289,16 @@ pub(crate) fn create(lua: &Lua) -> mlua::Result<(Table, Function)> {
     })?;
 
     let r = reg.clone();
-    let marker = cancelled_marker.clone();
     let join_raw = lua.create_async_function(move |_, id: u64| {
         let r = r.clone();
-        let marker = marker.clone();
         async move {
             let task = r.get(id)?;
             task.state.wait_done().await;
-            r.tasks.borrow_mut().remove(&id);
+            r.forget(id);
             let out = task.result.borrow_mut().take();
             Ok(match out {
                 Some(values) => values,
-                None => MultiValue::from_vec(vec![Value::Boolean(false), Value::Table(marker)]),
+                None => r.cancelled_values(),
             })
         }
     })?;
@@ -221,7 +312,7 @@ pub(crate) fn create(lua: &Lua) -> mlua::Result<(Table, Function)> {
     let r = reg.clone();
     let done_raw = lua.create_function(move |_, id: u64| Ok(r.get(id)?.state.is_done()))?;
 
-    let r = reg;
+    let r = reg.clone();
     let release_raw = lua.create_function(move |_, id: u64| {
         if let Some(task) = r.tasks.borrow_mut().remove(&id) {
             task.state.token.cancel();
@@ -243,7 +334,7 @@ pub(crate) fn create(lua: &Lua) -> mlua::Result<(Table, Function)> {
         release_raw,
         is_cancel_error,
         cancelled_marker,
-        channel_parts(lua)?,
+        channel_parts(lua, reg)?,
     ))
 }
 
@@ -256,15 +347,56 @@ fn closed_error(method: &str) -> mlua::Error {
     mlua::Error::runtime(format!("{method}: channel is closed"))
 }
 
-fn receive_only_error(method: &str) -> mlua::Error {
-    mlua::Error::runtime(format!(
-        "{method}: channel is receive-only (a host channel; the host sends)"
-    ))
+/// The error of a send into a receive-only channel (a host channel or
+/// a ticker), `Ok` for a local channel.
+fn check_sendable(method: &str, chan: &Chan) -> mlua::Result<()> {
+    match chan::receive_only(chan) {
+        None => Ok(()),
+        Some(why) => Err(mlua::Error::runtime(format!(
+            "{method}: channel is receive-only ({why})"
+        ))),
+    }
+}
+
+/// The period of `task.ticker(ms)`.
+fn ticker_period(ms: f64) -> mlua::Result<Duration> {
+    if ms.is_nan() || ms <= 0.0 {
+        return Err(mlua::Error::runtime("task.ticker: ms must be > 0"));
+    }
+    Duration::try_from_secs_f64(ms / 1000.0)
+        .ok()
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| mlua::Error::runtime("task.ticker: ms is out of range"))
+}
+
+/// The host task of a ticker: push the time of each tick (milliseconds
+/// since `start`, the tick's scheduled time) into `chan`, keeping only
+/// the newest unread one, until the task's token is cancelled or the
+/// channel is closed.  Closes the channel when it ends.
+async fn run_ticker(chan: Chan, start: tokio::time::Instant, period: Duration) {
+    let _close = CloseOnDrop(chan.clone());
+    let token = crate::hook::current_token();
+    let mut ticks = tokio::time::interval_at(start + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let at = match &token {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return,
+                at = ticks.tick() => at,
+            },
+            None => ticks.tick().await,
+        };
+        let ms = (at - start).as_nanos() as f64 / 1e6;
+        if !chan::push_newest(&chan, Value::Number(ms)) {
+            return;
+        }
+    }
 }
 
 /// The host functions under channels, timers and select, as the table
 /// `raw` that the library's Lua part reads.
-fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
+fn channel_parts(lua: &Lua, reg: Rc<Registry>) -> mlua::Result<Table> {
     let raw = lua.create_table()?;
 
     raw.set(
@@ -276,12 +408,9 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
                 _ => None,
             };
             match cap {
-                Some(0) => Err(mlua::Error::runtime(
-                    "task.channel: cap = 0 (rendezvous) is not supported yet",
-                )),
-                Some(n) if n >= 1 => Ok(ChanUd(chan::new(n as usize))),
+                Some(n) if n >= 0 => Ok(ChanUd(chan::new(n as usize))),
                 _ => Err(mlua::Error::runtime(
-                    "task.channel: cap must be an integer >= 1",
+                    "task.channel: cap must be an integer >= 0",
                 )),
             }
         })?,
@@ -293,16 +422,11 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
             let chan = select::chan_of(&ud);
             async move {
                 let chan = chan?;
-                if chan::is_host(&chan) {
-                    return Err(receive_only_error("ch:send"));
-                }
-                let mut slot = Some(v);
-                cancellable(async {
-                    std::future::poll_fn(|cx| chan::poll_send(&chan, cx, &mut slot))
-                        .await
-                        .map_err(|_| closed_error("ch:send"))
-                })
-                .await
+                check_sendable("ch:send", &chan)?;
+                let mut send = Sending::new(chan, v, None);
+                select::wait_send(&mut send)
+                    .await?
+                    .map_err(|_| closed_error("ch:send"))
             }
         })?,
     )?;
@@ -311,9 +435,7 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
         "try_send",
         lua.create_function(|_, (ud, v): (AnyUserData, Value)| {
             let chan = select::chan_of(&ud)?;
-            if chan::is_host(&chan) {
-                return Err(receive_only_error("ch:try_send"));
-            }
+            check_sendable("ch:try_send", &chan)?;
             chan::try_send(&chan, v).map_err(|_| closed_error("ch:try_send"))
         })?,
     )?;
@@ -323,9 +445,8 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
         lua.create_async_function(|lua, ud: AnyUserData| {
             let chan = select::chan_of(&ud);
             async move {
-                let chan = chan?;
-                let got = cancellable(std::future::poll_fn(|cx| chan::poll_recv(&chan, cx, &lua)))
-                    .await?;
+                let mut recv = Receiving::new(chan?, None);
+                let got = cancellable(std::future::poll_fn(|cx| recv.poll(cx, &lua))).await?;
                 Ok(select::recv_values(got))
             }
         })?,
@@ -383,12 +504,56 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
     )?;
 
     raw.set(
+        "ticker",
+        lua.create_function(|_, ms: f64| {
+            let period = ticker_period(ms)?;
+            let scope = scope::current_scope().ok_or_else(|| {
+                mlua::Error::runtime(
+                    "task.ticker: not inside a coroutine request or task (sync requests cannot tick)",
+                )
+            })?;
+            let chan = chan::new_ticker();
+            let start = tokio::time::Instant::now();
+            let task = scope.spawn_local(run_ticker(chan.clone(), start, period));
+            let ticker = TickerUd {
+                task: RefCell::new(Some(task)),
+                chan: chan.clone(),
+            };
+            Ok((ChanUd(chan), ticker))
+        })?,
+    )?;
+
+    raw.set(
+        "stop",
+        lua.create_function(|_, ud: AnyUserData| {
+            let t = ud.borrow::<TickerUd>()?;
+            // Dropping the `ScopedTask` cancels the host task.
+            let task = t.task.borrow_mut().take();
+            drop(task);
+            chan::close(&t.chan);
+            Ok(())
+        })?,
+    )?;
+
+    raw.set(
+        "task_case",
+        lua.create_function(move |_, id: u64| {
+            reg.get(id)?;
+            Ok(TaskUd {
+                id,
+                reg: reg.clone(),
+            })
+        })?,
+    )?;
+
+    raw.set(
         "select_raw",
         lua.create_async_function(|lua, (cases, opts): (Table, Option<Table>)| {
             let cases = select::read_cases(&lua, "task.select_raw", cases, opts, false);
             async move {
                 let Cases {
                     arms,
+                    mark,
                     default,
                     start,
                     ..
@@ -396,10 +561,11 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
                 let mut sel = SelectFuture {
                     arms,
                     start,
+                    mark,
                     lua: lua.clone(),
                 };
                 let (i, mut values) = match default {
-                    DefaultCase::None => cancellable(&mut sel).await?,
+                    DefaultCase::None => select::wait_select(&mut sel).await?,
                     _ => match sel.poll_now() {
                         Some(out) => out?,
                         None => return Ok(MultiValue::from_vec(vec![Value::Integer(0)])),
@@ -423,6 +589,7 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
             async move {
                 let Cases {
                     arms,
+                    mark,
                     handlers,
                     default,
                     start,
@@ -430,14 +597,17 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
                 let mut sel = SelectFuture {
                     arms,
                     start,
+                    mark,
                     lua: lua.clone(),
                 };
                 let (i, values) = match default {
                     DefaultCase::Handler(f) => match sel.poll_now() {
                         Some(out) => out?,
+                        // `poll_now` withdrew every case: no offer of
+                        // this select stays open while `default` runs.
                         None => return call.call_async::<MultiValue>(f).await,
                     },
-                    _ => cancellable(&mut sel).await?,
+                    _ => select::wait_select(&mut sel).await?,
                 };
                 // Call the handler in this same poll: no Lua code runs
                 // between the take and the handler, so a cancel arrives
@@ -450,7 +620,8 @@ fn channel_parts(lua: &Lua) -> mlua::Result<Table> {
                     Err(e) => {
                         // Raised before `pcall` entered the handler (the
                         // cancel hook, say): the handler never had the
-                        // value, so give it back.
+                        // value, so give it back (a sent value stays
+                        // sent).
                         sel.arms[i].untake(values);
                         Err(e)
                     }

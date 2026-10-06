@@ -306,14 +306,16 @@ fn values_are_shared_not_copied_and_nil_is_a_value() {
 }
 
 #[test]
-fn channel_capacity_must_be_at_least_one() {
+fn channel_capacity_must_be_a_non_negative_integer() {
     let e = env(GRACE);
-    let m = err_message(e.run("task.channel(0)"));
-    assert!(m.contains("cap = 0"), "got: {m}");
+    // `cap = 0` is a rendezvous channel (#26; tests/select_cases.rs).
+    assert_eq!(e.string("return tostring(task.channel(0):cap())"), "0");
     let m = err_message(e.run("task.channel(-1)"));
-    assert!(m.contains("cap must be an integer >= 1"), "got: {m}");
+    assert!(m.contains("cap must be an integer >= 0"), "got: {m}");
     let m = err_message(e.run("task.channel()"));
-    assert!(m.contains("cap must be an integer >= 1"), "got: {m}");
+    assert!(m.contains("cap must be an integer >= 0"), "got: {m}");
+    let m = err_message(e.run("task.channel(1.5)"));
+    assert!(m.contains("cap must be an integer >= 0"), "got: {m}");
 }
 
 // ── 2. close ──
