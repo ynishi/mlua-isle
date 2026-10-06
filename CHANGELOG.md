@@ -13,6 +13,21 @@
   host call, so a value it takes is either left in the channel or handed
   to the handler.  Contracts in the `runtime` module docs ("Channels,
   timers and select").
+- Host channels and requests (`tokio` feature; #24, part 2 of #19).
+  `runtime::channel::<T>(lua, cap)` returns a `Sender<T>` (`Send + Clone`;
+  `send`, `try_send`, `is_closed`) and a `LuaChannel`, the `task`
+  library's `Channel` object, receive-only on the Lua side (`send` /
+  `try_send` raise), with the same `recv` / `try_recv` / `close` / `select`
+  contract as a local channel.  Values are converted with `IntoLua` when
+  Lua takes them.  A channel of `Request<Req, Resp>` carries requests:
+  `Sender::request(req)` waits for Lua's `req:reply(v)` (`req.value`,
+  `req:replied()`, `<close>` answers `NoReply`).  Errors are the crate's
+  own: `SendError<T>`, `TrySendError<T>::{Full, Closed}`,
+  `RequestError<Req>::{Closed, NoReply}`.  Several Lua receivers on one
+  host channel are all woken.  No `send_timeout` (use
+  `tokio::time::timeout`); `select` does not close a request its handler
+  left unanswered.  Contracts in the `runtime` module docs ("Host
+  channels and requests").
 
 ### Changed
 - The cancel hook no longer raises a cancel while mlua runs the Lua code
