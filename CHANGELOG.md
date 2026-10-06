@@ -35,7 +35,9 @@
   channel only for the chosen case.  `task.channel(0)` is a rendezvous
   channel (was rejected): `send` returns once a receiver has taken the
   value, `try_send` succeeds only with a waiting receiver (a `recv` or a
-  select's receive case), a select never pairs its own send and receive
+  select's receive case), and so does a send case in a select with
+  `default` (`default` runs only when no receiver waits), a select never
+  pairs its own send and receive
   cases, a select whose offer was taken chooses that send case, and a
   `send` whose offer was taken before a cancel returns as sent (#19,
   Open 5).  `h:on(f)` / `h:arm()` on a `task.spawn` handle: a case that

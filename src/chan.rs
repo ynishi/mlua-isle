@@ -155,6 +155,24 @@ impl ChanCore {
         wakers
     }
 
+    /// Put `v` in the slot of the first waiting receiver that `me` may
+    /// pair with (an empty slot, not of the same select, not of a select
+    /// that already has its case) and return its waker; `Err(v)` when
+    /// there is none.
+    fn fill_waiter(&mut self, v: Value, me: &Option<Mark>) -> Result<Waker, Value> {
+        let waiter = self.waiters.iter().find(|w| {
+            w.slot.borrow().is_none() && !claimed(&w.select) && !same_select(&w.select, me)
+        });
+        match waiter {
+            Some(w) => {
+                *w.slot.borrow_mut() = Some(v);
+                let waker = w.waker.borrow().clone();
+                Ok(waker)
+            }
+            None => Err(v),
+        }
+    }
+
     /// Take the first open offer that `me` may pair with: not of the
     /// same select, and not of a select that already has its case.
     /// Marks it taken and claims its select; returns the value and the
@@ -457,20 +475,14 @@ pub(crate) fn try_send(chan: &Chan, v: Value) -> Result<bool, Closed> {
         return Err(Closed);
     }
     if c.cap == 0 {
-        let waiter = c
-            .waiters
-            .iter()
-            .find(|w| w.slot.borrow().is_none() && !claimed(&w.select))
-            .cloned();
+        let filled = c.fill_waiter(v, &None);
         drop(c);
-        return Ok(match waiter {
-            Some(w) => {
-                *w.slot.borrow_mut() = Some(v);
-                let waker = w.waker.borrow().clone();
+        return Ok(match filled {
+            Ok(waker) => {
                 waker.wake();
                 true
             }
-            None => false,
+            Err(_) => false,
         });
     }
     if c.buf.len() >= c.cap {
@@ -667,6 +679,10 @@ pub(crate) struct Sending {
     value: Option<Value>,
     select: Option<Mark>,
     offer: Option<Rc<Offer>>,
+    /// Rendezvous, for a select's check without waiting (`default`):
+    /// hand the value to a waiting receiver, as `try_send` does, instead
+    /// of posting an offer.
+    eager: bool,
 }
 
 impl Sending {
@@ -678,13 +694,23 @@ impl Sending {
             value: Some(v),
             select,
             offer: None,
+            eager: false,
         }
+    }
+
+    /// Make the next poll of a rendezvous send not wait: it is ready
+    /// when a receiver is waiting (the value goes to that receiver's
+    /// slot, as with `try_send`) and posts no offer otherwise.
+    pub(crate) fn set_eager(&mut self) {
+        self.eager = true;
     }
 
     /// `Ready(Ok)` once the value is sent, `Ready(Err(Closed))` when the
     /// channel is closed (nothing sent).  Buffered: as [`poll_send`].
     /// Rendezvous: the first poll posts the offer and wakes the waiting
     /// receivers; the send is complete once a receiver took the offer.
+    /// An eager send (see [`set_eager`](Self::set_eager)) instead fills
+    /// the slot of a waiting receiver, or stays pending without posting.
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Closed>> {
         if self.chan.borrow().cap != 0 {
             return poll_send(&self.chan, cx, &mut self.value);
@@ -705,6 +731,22 @@ impl Sending {
         let mut c = self.chan.borrow_mut();
         if c.closed {
             return Poll::Ready(Err(Closed));
+        }
+        if self.eager {
+            let Some(v) = self.value.take() else {
+                return Poll::Pending;
+            };
+            return match c.fill_waiter(v, &self.select) {
+                Ok(waker) => {
+                    drop(c);
+                    waker.wake();
+                    Poll::Ready(Ok(()))
+                }
+                Err(v) => {
+                    self.value = Some(v);
+                    Poll::Pending
+                }
+            };
         }
         let offer = Rc::new(Offer {
             value: RefCell::new(self.value.take()),

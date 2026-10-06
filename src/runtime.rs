@@ -230,9 +230,12 @@
 //!   its offers are withdrawn and are never received.
 //! - `close`: waiting senders raise "channel is closed" (a send case is
 //!   chosen with `sent = false`); waiting receivers get `nil, false`.
-//! - With `default`, a send case on a rendezvous channel is not ready
-//!   on the first check even if a receiver waits (its offer is posted
-//!   and withdrawn in the same check); use `try_send` for that.
+//! - With `default`, a send case on a rendezvous channel is ready on
+//!   the first check when a receiver is waiting (a `recv`, or another
+//!   select's receive case): its value goes to the first such receiver,
+//!   as with `try_send`, and the case is chosen with `sent = true`.
+//!   With no receiver waiting, `default` runs and nothing is posted, so
+//!   the value is never received.
 //!
 //! **Timers**: `task.after(ms)` is ready once `ms` milliseconds have
 //! passed since it was created (`ms <= 0`: at once).  It may be waited
@@ -275,6 +278,10 @@
 //!   joined, or used in another select, later.
 //! - Building a case from a joined handle raises, and so does a select
 //!   given a case whose handle was joined since.
+//! - A handle that is joined elsewhere (`h:join()`, or another select's
+//!   case) while a select waits on its case: the join takes the result,
+//!   and the waiting select raises "task already joined" once the task
+//!   has finished.
 //!
 //! **select**
 //!

@@ -247,7 +247,15 @@ impl SelectFuture {
     /// ready.  A no-op waker is registered with the arms that are not
     /// ready; it is dropped at their next wake-up.  When it returns
     /// `None`, every arm has been withdrawn.
+    ///
+    /// A rendezvous send case is ready here when a receiver is waiting:
+    /// its value goes to that receiver, as with `try_send`.
     pub(crate) fn poll_now(&mut self) -> Option<mlua::Result<(usize, MultiValue)>> {
+        for arm in &mut self.arms {
+            if let Arm::Send(send) = arm {
+                send.set_eager();
+            }
+        }
         let mut cx = Context::from_waker(std::task::Waker::noop());
         match Pin::new(&mut *self).poll(&mut cx) {
             Poll::Ready(out) => Some(out),
