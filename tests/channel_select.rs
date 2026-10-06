@@ -825,7 +825,7 @@ fn a_value_taken_for_a_handler_that_was_never_entered_goes_back() {
 // ── the cancel hook and mlua's async poll chunk ──
 //
 // mlua runs every async host function through a Lua chunk of its own
-// (named `=__mlua_async_poll` in its source), which returns the future's results with a few
+// (source `=__mlua_async_poll`), which returns the future's results with a few
 // instructions of its own.  The hook does not raise a cancel there; it
 // raises it at the next check outside the chunk.
 //
@@ -843,25 +843,10 @@ fn a_value_taken_for_a_handler_that_was_never_entered_goes_back() {
 // there with the token cancelled.  Both runs use a fresh VM and the
 // same code, so the instruction indices match.
 
-/// Whether `debug` is in mlua's async poll chunk: its name does not
-/// survive mlua's chunk cache (source "?"), so it is recognised by its
-/// environment, as `hub.rs` does.
+/// Whether `debug` is in mlua's async poll chunk (mlua >= 0.12.2 keeps
+/// its name as the source).
 fn in_async_poll(debug: &mlua::debug::Debug) -> bool {
-    {
-        let src = debug.source();
-        if src.what != "main" || src.source.as_deref() != Some("?") {
-            return false;
-        }
-    }
-    debug.function().environment().is_some_and(|env| {
-        matches!(
-            env.raw_get::<mlua::Value>("get_future"),
-            Ok(mlua::Value::Function(_))
-        ) && matches!(
-            env.raw_get::<mlua::Value>("poll"),
-            Ok(mlua::Value::Function(_))
-        )
-    })
+    debug.source().source.as_deref() == Some("=__mlua_async_poll")
 }
 
 #[derive(Default)]

@@ -24,26 +24,25 @@ use std::rc::Rc;
 /// Instruction interval of the cancel check.
 pub(crate) const CANCEL_CHECK_INTERVAL: u32 = 1000;
 
-/// Chunk name that mlua gives the Lua code through which it runs every
-/// async host function (`RawLua::create_async_callback`, mlua 0.12.1
-/// `src/state/raw.rs:1582`: `.set_name("=__mlua_async_poll")`).  The
-/// code polls the host future and, once the future is ready, returns
-/// its results with a few more instructions of its own.
+/// Chunk name of the Lua code through which mlua runs every async host
+/// function (`RawLua::create_async_callback`, mlua 0.12.2
+/// `src/state/raw.rs:1624-1667`).  The function that chunk returns
+/// polls the host future and, once the future is ready, returns its
+/// results with a few more instructions of its own.
 ///
-/// The name does not reach the debug info: the chunk is loaded with
-/// `try_cache()` (`src/state/raw.rs:1581`), which first compiles the
-/// text without a name (`Chunk::compile`, `src/chunk.rs:675`: chunk
-/// name "?") and loads the dumped bytecode, which keeps that source.
-/// [`in_async_poll`] therefore also recognises the chunk by its
-/// environment.
+/// mlua sets the name before `try_cache()` (`src/state/raw.rs:1665-1666`;
+/// `Chunk::compile` compiles with it, `src/chunk.rs:678-680`), so the
+/// name is the source of that function, and mlua recognises it the same
+/// way (`RawLua::is_async_wrapper_yield`, `src/state/raw.rs:1671-1678`).
+/// Requires mlua 0.12.2: in 0.12.1 the cache dropped the name.
 const ASYNC_POLL_CHUNK: &str = "=__mlua_async_poll";
 
 /// How many cancel checks may be deferred because they landed in mlua's
 /// async poll chunk before the cancel is raised anyway (the count is
-/// reset when a cancel is raised).  Bounds
-/// the delay for a loop whose checks keep landing there (an async host
-/// function that is always ready and not `cancellable`, called in a
-/// loop whose length divides the check interval).
+/// reset when a cancel is raised).  Bounds the delay for a loop whose
+/// checks keep landing there (an async host function that is always
+/// ready and not `cancellable`, called in a loop whose length divides
+/// the check interval).
 const MAX_DEFERRED: u32 = 16;
 
 /// Whether the hook fired in mlua's async poll chunk.
@@ -56,34 +55,10 @@ const MAX_DEFERRED: u32 = 16;
 /// `cancellable` await.  Before the future is ready, deferring changes
 /// nothing: a `cancellable` future returns the cancel itself.
 ///
-/// Recognised as a main chunk whose source is [`ASYNC_POLL_CHUNK`], or
-/// `"?"` with the environment mlua gives the poll chunk (`get_future`
-/// and `poll` functions; mlua 0.12.1 `src/state/raw.rs:1536-1540`).
-/// Other chunks mlua compiles through `try_cache()` (the wrapper of
-/// `Function::bind`, say) also have the source `"?"` but not that
-/// environment.
+/// Recognised by the source of the running function
+/// ([`ASYNC_POLL_CHUNK`]).
 fn in_async_poll(debug: &Debug) -> bool {
-    {
-        let src = debug.source();
-        if src.what != "main" {
-            return false;
-        }
-        match src.source.as_deref() {
-            Some(ASYNC_POLL_CHUNK) => return true,
-            Some("?") => {}
-            _ => return false,
-        }
-    }
-    let is_fn = |env: &mlua::Table, key: &str| {
-        matches!(
-            env.raw_get::<mlua::Value>(key),
-            Ok(mlua::Value::Function(_))
-        )
-    };
-    debug
-        .function()
-        .environment()
-        .is_some_and(|env| is_fn(&env, "get_future") && is_fn(&env, "poll"))
+    debug.source().source.as_deref() == Some(ASYNC_POLL_CHUNK)
 }
 
 type Callback = dyn Fn(&Lua, &Debug) -> mlua::Result<VmState>;
@@ -420,25 +395,9 @@ mod tests {
         lua.load("local x = 1").exec().unwrap();
     }
 
-    /// A chunk that looks like mlua's async poll chunk (source "?",
-    /// `get_future` and `poll` in its environment).
-    fn poll_like(lua: &Lua, code: &str, with_env: bool) -> mlua::Function {
-        let env = lua.create_table().unwrap();
-        if with_env {
-            let f = lua.create_function(|_, ()| Ok(())).unwrap();
-            env.set("get_future", f.clone()).unwrap();
-            env.set("poll", f).unwrap();
-        }
-        lua.load(code)
-            .set_name("?")
-            .set_environment(env)
-            .into_function()
-            .unwrap()
-    }
-
-    /// A cancel check that lands in mlua's async poll chunk is deferred,
-    /// but only `MAX_DEFERRED` times in a row: a loop there is still
-    /// cancelled.
+    /// A cancel check that lands in a chunk named like mlua's async poll
+    /// chunk is deferred, but only `MAX_DEFERRED` times: a loop there is
+    /// still cancelled.
     #[test]
     fn cancel_in_the_async_poll_chunk_is_deferred_but_not_forever() {
         let lua = Lua::new();
@@ -447,15 +406,22 @@ mod tests {
         token.cancel();
         let _enter = EnterGuard::new(&token);
         let counting = "local n = 0 for i = 1, 3000 do n = n + 1 end return n";
-        let counted: i64 = poll_like(&lua, counting, true).call(()).unwrap();
+        let counted: i64 = lua
+            .load(counting)
+            .set_name(ASYNC_POLL_CHUNK)
+            .eval()
+            .unwrap();
         assert_eq!(counted, 3000);
         assert!(hub(&lua).deferred.get() > 0);
-        assert_cancelled(poll_like(&lua, "while true do end", true).call(()));
+        assert_cancelled(
+            lua.load("while true do end")
+                .set_name(ASYNC_POLL_CHUNK)
+                .exec(),
+        );
         assert_eq!(hub(&lua).deferred.get(), 0);
-        // A "?" chunk without that environment, and any other chunk, is
-        // cancelled at the first check.
-        assert_cancelled(poll_like(&lua, counting, false).call::<i64>(()).map(drop));
-        assert_cancelled(lua.load(counting).exec());
+        // Any other chunk is cancelled at the first check.
+        assert_cancelled(lua.load(counting).set_name("=other").exec());
+        assert_eq!(hub(&lua).deferred.get(), 0);
     }
 
     #[test]

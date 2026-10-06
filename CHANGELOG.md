@@ -21,7 +21,10 @@
   deferred checks regardless).  A value that `ch:recv` / `task.select_raw`
   (or any async host function) returned therefore reaches the caller, and
   a `ch:send` that pushed its value returns normally, when a cancel
-  arrives at that moment.
+  arrives at that moment.  The chunk is recognised by its source name,
+  `=__mlua_async_poll`, which mlua keeps from 0.12.2 on.
+- Requires mlua 0.12.2 or later (was 0.12): in 0.12.1 the async poll
+  chunk loses its name, so the deferral above would not apply.
 
 ## [0.8.0] - 2026-09-25
 

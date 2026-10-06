@@ -254,7 +254,9 @@
 //!   not only the library's.  A program that keeps landing its checks in
 //!   that code (an async host function that is always ready and not
 //!   `cancellable`, called in a tight loop) is still cancelled: the hook
-//!   defers at most 16 checks before it raises anyway.
+//!   defers at most 16 checks before it raises anyway.  The code is
+//!   recognised by its chunk name, which mlua keeps from 0.12.2 on (the
+//!   crate requires it).
 //!
 //! A task waiting in a select (or any of these waits) is cancelled with
 //! its scope and ends within the grace like any other wait.
