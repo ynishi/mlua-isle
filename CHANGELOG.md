@@ -14,6 +14,15 @@
   to the handler.  Contracts in the `runtime` module docs ("Channels,
   timers and select").
 
+### Changed
+- The cancel hook no longer raises a cancel while mlua runs the Lua code
+  that returns an async host function's results (its async poll chunk);
+  it raises it at the next check outside that code (and after at most 16
+  deferred checks regardless).  A value that `ch:recv` / `task.select_raw`
+  (or any async host function) returned therefore reaches the caller, and
+  a `ch:send` that pushed its value returns normally, when a cancel
+  arrives at that moment.
+
 ## [0.8.0] - 2026-09-25
 
 ### Breaking

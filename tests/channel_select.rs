@@ -821,3 +821,225 @@ fn a_value_taken_for_a_handler_that_was_never_entered_goes_back() {
     );
     assert_eq!(r, "false injected before the handler 0 2 first second");
 }
+
+// ── the cancel hook and mlua's async poll chunk ──
+//
+// mlua runs every async host function through a Lua chunk of its own
+// (named `=__mlua_async_poll` in its source), which returns the future's results with a few
+// instructions of its own.  The hook does not raise a cancel there; it
+// raises it at the next check outside the chunk.
+//
+// To test this deterministically, the cancel check has to land on one
+// of those instructions with the token already cancelled.  A hook
+// callback registered with `every_nth_instruction(1)` makes the hook
+// fire on every instruction, and the cancel check then runs on every
+// 1000th of them (`hub.rs`: the check interval divided by the step).
+// The callback counts the events, so its count equals the hub's.  A
+// probe run finds the index of the chunk's last instruction (the one
+// that returns to the caller); the real run inserts padding
+// instructions (`x = x + 1`, one instruction each) before the call so
+// that this instruction becomes a cancel check, cancels the token on
+// the instruction before it, and records that the check really landed
+// there with the token cancelled.  Both runs use a fresh VM and the
+// same code, so the instruction indices match.
+
+/// Whether `debug` is in mlua's async poll chunk: its name does not
+/// survive mlua's chunk cache (source "?"), so it is recognised by its
+/// environment, as `hub.rs` does.
+fn in_async_poll(debug: &mlua::debug::Debug) -> bool {
+    {
+        let src = debug.source();
+        if src.what != "main" || src.source.as_deref() != Some("?") {
+            return false;
+        }
+    }
+    debug.function().environment().is_some_and(|env| {
+        matches!(
+            env.raw_get::<mlua::Value>("get_future"),
+            Ok(mlua::Value::Function(_))
+        ) && matches!(
+            env.raw_get::<mlua::Value>("poll"),
+            Ok(mlua::Value::Function(_))
+        )
+    })
+}
+
+#[derive(Default)]
+struct Probe {
+    /// Count events since the callback was registered.
+    n: std::cell::Cell<u64>,
+    /// Set by `arm()` just before the call under test.
+    armed: std::cell::Cell<bool>,
+    /// Index of the latest event in the poll chunk after `arm()`.
+    last_in_chunk: std::cell::Cell<u64>,
+    /// Index of the chunk's last instruction (set once it is left).
+    target: std::cell::Cell<u64>,
+    /// Real run: cancel on this event.
+    cancel_at: std::cell::Cell<u64>,
+    cancel_was_in_chunk: std::cell::Cell<bool>,
+    /// Real run: the check at `cancel_at + 1` ran in the chunk with the
+    /// token cancelled and did not raise.
+    deferred_in_chunk: std::cell::Cell<bool>,
+}
+
+/// Run `src` (with `--PAD--` replaced by `pad` padding instructions)
+/// in a fresh VM whose hook fires on every instruction.
+fn run_probed(
+    src: &str,
+    pad: u64,
+    probe: &std::rc::Rc<Probe>,
+    token: &CancelToken,
+    spin: bool,
+) -> (Env, Result<mlua::MultiValue, IsleError>, Duration) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let lua = mlua::Lua::new();
+    let vm = Vm::attach(&lua, GRACE).unwrap();
+    // Registered before any Lua runs, so the count matches the hub's.
+    let p = probe.clone();
+    let t = token.clone();
+    vm.add_hook(
+        mlua::HookTriggers::new().every_nth_instruction(1),
+        move |_, debug| {
+            let n = p.n.get() + 1;
+            p.n.set(n);
+            if !p.armed.get() {
+                return Ok(mlua::VmState::Continue);
+            }
+            let in_chunk = in_async_poll(debug);
+            if in_chunk {
+                p.last_in_chunk.set(n);
+            } else if p.last_in_chunk.get() != 0 && p.target.get() == 0 {
+                p.target.set(p.last_in_chunk.get());
+            }
+            if n == p.cancel_at.get() {
+                p.cancel_was_in_chunk.set(in_chunk);
+                t.cancel();
+            }
+            if n == p.cancel_at.get() + 1 && n.is_multiple_of(1000) && in_chunk && t.is_cancelled()
+            {
+                p.deferred_in_chunk.set(true);
+            }
+            Ok(mlua::VmState::Continue)
+        },
+    )
+    .unwrap();
+    let g = lua.globals();
+    g.set("task", vm.task_lib().unwrap()).unwrap();
+    let p = probe.clone();
+    g.set(
+        "arm",
+        lua.create_function(move |_, ()| {
+            p.armed.set(true);
+            Ok(())
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    g.set("spin", spin).unwrap();
+    let padding = "x = x + 1\n".repeat(pad as usize);
+    let src = src.replace("--PAD--", &padding);
+    let f: mlua::Function = lua.load(&src).into_function().unwrap();
+    let start = Instant::now();
+    let r = local.block_on(&rt, async {
+        tokio::time::timeout(Duration::from_secs(2), vm.run(token, f, ()))
+            .await
+            .expect("timed out")
+    });
+    let elapsed = start.elapsed();
+    let e = Env { rt, local, lua, vm };
+    (e, r, elapsed)
+}
+
+/// Probe `src`, then run it with the cancel check aligned on the poll
+/// chunk's last instruction and the token cancelled just before it.
+/// Asserts that the check landed there and that the run still ended
+/// as cancelled within the grace (the `while spin do end` loop after
+/// the call is cancelled at a later check).
+fn run_with_cancel_in_poll_chunk(src: &str) -> Env {
+    let probe = std::rc::Rc::new(Probe::default());
+    let (_, r, _) = run_probed(src, 0, &probe, &CancelToken::new(), false);
+    r.unwrap_or_else(|e| panic!("probe run failed: {e}"));
+    let target = probe.target.get();
+    assert!(target > 0, "the probe saw no poll chunk");
+    let pad = (1000 - target % 1000) % 1000;
+
+    let real = std::rc::Rc::new(Probe::default());
+    real.cancel_at.set(target + pad - 1);
+    let token = CancelToken::new();
+    let (e, r, elapsed) = run_probed(src, pad, &real, &token, true);
+    assert!(
+        real.cancel_was_in_chunk.get(),
+        "cancelled outside the chunk"
+    );
+    assert!(
+        real.deferred_in_chunk.get(),
+        "the check at {} did not pass in the chunk with the token cancelled \
+         (raised there, or the chunk moved: it ended at {})",
+        target + pad,
+        real.target.get()
+    );
+    assert_eq!(
+        real.target.get(),
+        target + pad,
+        "padding did not shift the chunk"
+    );
+    assert!(matches!(r, Err(IsleError::Cancelled)), "got {r:?}");
+    assert!(elapsed < Duration::from_millis(300), "{elapsed:?}");
+    e
+}
+
+#[test]
+fn a_cancel_in_the_poll_chunk_does_not_lose_the_value_recv_returned() {
+    let e = run_with_cancel_in_poll_chunk(
+        "local ch = task.channel(2)
+         ch:send('x')
+         local x = 0
+         --PAD--
+         arm()
+         local v, ok = ch:recv()
+         seen = tostring(v) .. ' ' .. tostring(ok)
+         while spin do end",
+    );
+    assert_eq!(e.global::<String>("seen"), "x true");
+}
+
+#[test]
+fn a_cancel_in_the_poll_chunk_does_not_lose_the_value_select_raw_returned() {
+    let e = run_with_cancel_in_poll_chunk(
+        "local ch = task.channel(2)
+         ch:send('x')
+         local arms = { ch:arm_recv() }
+         local x = 0
+         --PAD--
+         arm()
+         local i, v, ok = task.select_raw(arms)
+         seen = i .. ' ' .. tostring(v) .. ' ' .. tostring(ok)
+         while spin do end",
+    );
+    assert_eq!(e.global::<String>("seen"), "1 x true");
+}
+
+#[test]
+fn a_cancel_in_the_poll_chunk_lets_a_completed_send_return() {
+    let e = run_with_cancel_in_poll_chunk(
+        "local ch = task.channel(2)
+         chan = ch
+         local x = 0
+         --PAD--
+         arm()
+         ch:send('y')
+         sent = true
+         while spin do end",
+    );
+    assert!(e.global::<bool>("sent"));
+    let r: String = e
+        .lua
+        .load("return chan:len() .. ' ' .. chan:try_recv()")
+        .eval()
+        .unwrap();
+    assert_eq!(r, "1 y");
+}

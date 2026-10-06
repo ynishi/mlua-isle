@@ -78,7 +78,9 @@
 //!
 //! 1. raises the cancellation error ([`Cancelled`]) when the token of
 //!    the request or task currently executing is cancelled (checked
-//!    every 1000 instructions),
+//!    every 1000 instructions; a check that lands in the code mlua uses
+//!    to return an async host function's results is deferred, see
+//!    [Channels, timers and select](#channels-timers-and-select)),
 //! 2. calls the callbacks registered with [`Vm::add_hook`], each at its
 //!    own [`HookTriggers`],
 //! 3. yields the running root coroutine or task every N checks when
@@ -242,14 +244,17 @@
 //!   (nothing consumed) or inside the handler (the handler has the
 //!   value).  An error raised after the take but before the handler is
 //!   entered puts the value back at the front of its channel.
-//!
-//! Known limit: mlua returns an async host function's results through a
-//! few instructions of Lua code of its own.  A cancel raised by the hook
-//! in those instructions, after `recv` or `select_raw` took a value and
-//! before the call returned it, loses that value; in the same gap, a
-//! `send` that pushed its value raises the cancel.  `select` does not
-//! have this gap for its value (the handler has the value before the
-//! call returns).
+//! - Between a host function's future becoming ready and the call
+//!   returning, mlua runs a few instructions of Lua code of its own (the
+//!   loop that polls the future).  The cancel hook does not raise there:
+//!   it raises at the next check outside that code (or the next
+//!   `cancellable` wait returns the cancel), so a value `recv` or
+//!   `select_raw` took reaches the caller, and a `send` that pushed its
+//!   value returns normally.  This holds for every async host function,
+//!   not only the library's.  A program that keeps landing its checks in
+//!   that code (an async host function that is always ready and not
+//!   `cancellable`, called in a tight loop) is still cancelled: the hook
+//!   defers at most 16 checks before it raises anyway.
 //!
 //! A task waiting in a select (or any of these waits) is cancelled with
 //! its scope and ends within the grace like any other wait.
