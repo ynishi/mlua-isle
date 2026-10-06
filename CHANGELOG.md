@@ -28,6 +28,25 @@
   `tokio::time::timeout`); `select` does not close a request its handler
   left unanswered.  Contracts in the `runtime` module docs ("Host
   channels and requests").
+- Send cases, rendezvous channels, task-finish cases and tickers in the
+  `task` library (#26, part 3 of #19).  `ch:on_send(v, f)` /
+  `ch:arm_send(v)`: a send case, chosen when `v` can be pushed (or with
+  `sent = false` when the channel is closed); the value enters the
+  channel only for the chosen case.  `task.channel(0)` is a rendezvous
+  channel (was rejected): `send` returns once a receiver has taken the
+  value, `try_send` succeeds only with a waiting receiver (a `recv` or a
+  select's receive case), and so does a send case in a select with
+  `default` (`default` runs only when no receiver waits), a select never
+  pairs its own send and receive
+  cases, a select whose offer was taken chooses that send case, and a
+  `send` whose offer was taken before a cancel returns as sent (#19,
+  Open 5).  `h:on(f)` / `h:arm()` on a `task.spawn` handle: a case that
+  is ready when the task has finished, returns what `h:join()` would and
+  marks the handle joined.  `task.ticker(ms)`: a receive-only channel of
+  capacity 1 fed by a host task in the caller's scope, each tick the
+  milliseconds since the ticker started, the newest tick replacing an
+  unread one; `tk:stop()` stops it.  Contracts in the `runtime` module
+  docs ("Channels, timers and select").
 
 ### Changed
 - The cancel hook no longer raises a cancel while mlua runs the Lua code

@@ -101,29 +101,32 @@
 //! | Lua | meaning |
 //! |---|---|
 //! | `task.spawn(f, ...)` | Start `f(...)` as a concurrent task of the current coroutine request or task.  Returns a handle. |
-//! | `h:join()` | Wait for the task.  Returns `true, ...` (what `f` returned) or `false, err`, where `err` is the raw Lua error value, or `task.CANCELLED` if the task was cancelled.  A handle can be joined once. |
+//! | `h:join()` | Wait for the task.  Returns `true, ...` (what `f` returned) or `false, err`, where `err` is the raw Lua error value, or `task.CANCELLED` if the task was cancelled.  A handle can be joined once (a chosen `h:on` / `h:arm` case counts as the join). |
 //! | `h:cancel()` | Request cancellation.  Does not wait. |
 //! | `h:done()` | Whether the task has finished. |
 //! | `local h <close> = task.spawn(...)` | On scope exit, a task that was not joined is cancelled and waited for. |
 //! | `task.is_cancelled(err)` | Whether `err` is a cancellation: the error a cancel raises (caught with `pcall`, or received by a `__close` handler) or `task.CANCELLED`.  `false` for any other value. |
 //! | `task.CANCELLED` | What `join` returns as `err` for a cancelled task. |
-//! | `task.channel(cap)` | A local channel holding up to `cap` values (`cap >= 1`; `cap = 0` raises).  See [Channels, timers and select](#channels-timers-and-select). |
-//! | `ch:send(v)` | Push `v`; waits while the channel is full.  Raises when the channel is closed. |
-//! | `ch:try_send(v)` | Push `v` without waiting: `true`, or `false` when full.  Raises when the channel is closed. |
+//! | `task.channel(cap)` | A local channel holding up to `cap` values (`cap >= 0`; `cap = 0` is a rendezvous channel).  See [Channels, timers and select](#channels-timers-and-select). |
+//! | `ch:send(v)` | Push `v`; waits while the channel is full (rendezvous: until a receiver has taken `v`).  Raises when the channel is closed. |
+//! | `ch:try_send(v)` | Push `v` without waiting: `true`, or `false` when full (rendezvous: `true` only if a receiver is waiting right now).  Raises when the channel is closed. |
 //! | `ch:recv()` | Take the value at the front; waits while the channel is empty.  Returns `v, true`, or `nil, false` when the channel is closed and empty. |
 //! | `ch:try_recv()` | Take without waiting.  Returns `v, ok, ready`: `v, true, true` (a value), `nil, false, true` (closed and empty) or `nil, false, false` (empty, not closed). |
 //! | `ch:close()` | Close the channel.  Idempotent. |
 //! | `ch:closed()`, `ch:len()`, `ch:cap()` | Whether it is closed; how many values it holds; its capacity. |
 //! | `task.after(ms)` | A one-shot timer, ready `ms` milliseconds after this call (`ms <= 0`: at once) and from then on. |
 //! | `t:wait()` | Wait until the timer is ready. |
-//! | `ch:on(f)`, `t:on(f)` | A case for `task.select`: receive from `ch` and call `f(v, ok)`; or call `f()` when `t` is ready. |
+//! | `task.ticker(ms)` | A receive-only channel of capacity 1 that receives a tick every `ms` milliseconds (`ms > 0`): the tick's time in milliseconds since the ticker started.  Stops with the scope that created it. |
+//! | `tk:stop()` | Stop the ticker and close its channel.  Idempotent. |
+//! | `ch:on(f)`, `ch:on_send(v, f)`, `t:on(f)`, `h:on(f)` | A case for `task.select`: receive from `ch` and call `f(v, ok)`; send `v` into `ch` and call `f(sent)` (`sent = false`: the channel was closed); call `f()` when `t` is ready; call `f(ok, ...)` with what `h:join()` returns once the task `h` has finished. |
 //! | `task.select(cases, opts)` | Wait until one case is ready, take it, call its handler and return what the handler returns.  `opts.biased` (default `false`): check the cases in order instead of round robin.  `opts.default = f`: if no case is ready, call `f()` instead of waiting. |
-//! | `ch:arm_recv()`, `t:arm()` | A case for `task.select_raw`. |
-//! | `task.select_raw(arms, opts)` | As `task.select`, without handlers: returns the index of the chosen case and its values (`i, v, ok` for a receive, `i` for a timer).  `opts.default = true`: return `0` if no case is ready. |
+//! | `ch:arm_recv()`, `ch:arm_send(v)`, `t:arm()`, `h:arm()` | A case for `task.select_raw`. |
+//! | `task.select_raw(arms, opts)` | As `task.select`, without handlers: returns the index of the chosen case and its values (`i, v, ok` for a receive, `i, sent` for a send, `i` for a timer, `i, ok, ...` for a task).  `opts.default = true`: return `0` if no case is ready. |
 //! | `req.value`, `req:reply(v)`, `req:replied()`, `local req <close> = ...` | A `Request` received from a host channel.  See [Host channels and requests](#host-channels-and-requests). |
 //!
-//! A host channel (`channel`) is a `Channel` object like
-//! `task.channel`'s, receive-only: `send` / `try_send` raise.
+//! A host channel (`channel`) and a ticker are `Channel` objects like
+//! `task.channel`'s, receive-only: `send` / `try_send` and send cases
+//! raise.
 //!
 //! Tasks are **structured**: when a coroutine request or task finishes,
 //! the tasks it spawned and did not join are cancelled, and it waits
@@ -205,10 +208,80 @@
 //!   `try_send` loop) keeps receivers on the same thread from running;
 //!   `send`, which waits when the channel is full, is the form to use.
 //!
+//! **Rendezvous channels** (`task.channel(0)`)
+//!
+//! - A sender posts an *offer* and waits until a receiver takes it:
+//!   `send` returns once a receiver has taken the value.  Receivers take
+//!   offers in the order they were posted (FIFO among senders).
+//! - `try_send` succeeds only when a receiver is waiting right now (a
+//!   `recv`, or a select's receive case: the two wait the same way); it
+//!   hands the value to the first waiting receiver and posts nothing.
+//!   `try_recv` takes the first offer.
+//! - `len()` and `cap()` are `0`.  The one exception is a value handed
+//!   to a waiting receiver that then did not take it (its select chose
+//!   another case, or it was cancelled): the value goes back to the
+//!   front of the channel, counts in `len()`, and is received next.
+//! - A select never pairs its own send case with its own receive case
+//!   on the same channel; two different selects do pair.
+//! - A select whose send case's offer was taken chooses that case, even
+//!   if another case is ready by the time it runs again: the value is
+//!   delivered.  At most one of a select's offers is taken.  When a
+//!   select chooses another case (or runs `default`, or is cancelled),
+//!   its offers are withdrawn and are never received.
+//! - `close`: waiting senders raise "channel is closed" (a send case is
+//!   chosen with `sent = false`); waiting receivers get `nil, false`.
+//! - With `default`, a send case on a rendezvous channel is ready on
+//!   the first check when a receiver is waiting (a `recv`, or another
+//!   select's receive case): its value goes to the first such receiver,
+//!   as with `try_send`, and the case is chosen with `sent = true`.
+//!   With no receiver waiting, `default` runs and nothing is posted, so
+//!   the value is never received.
+//!
 //! **Timers**: `task.after(ms)` is ready once `ms` milliseconds have
 //! passed since it was created (`ms <= 0`: at once).  It may be waited
 //! on, or used as a case, any number of times; once ready it stays
 //! ready.
+//!
+//! **Tickers**: `task.ticker(ms)` is a receive-only channel of capacity
+//! 1 that a host task, spawned into the scope of the request or task
+//! that called it (as `ScopeHandle::spawn_local` does), feeds every `ms`
+//! milliseconds.
+//!
+//! - A tick is the tick's scheduled time in milliseconds since the
+//!   ticker started: `ms`, `2 * ms`, ... (the tick count is the value
+//!   divided by `ms`).
+//! - Only the newest tick is kept: an unread tick is replaced, not
+//!   queued.  Ticks that a busy VM missed are skipped
+//!   (`tokio::time::MissedTickBehavior::Skip`).
+//! - `tk:stop()` stops the host task and closes the channel; a tick
+//!   already in it can still be received.  The ticker also stops, and
+//!   its channel closes, when the scope that created it ends or is
+//!   cancelled (within the grace), when Lua closes the channel, and when
+//!   the ticker object is collected.
+//! - Outside a coroutine request or task (a sync request) `task.ticker`
+//!   raises.
+//!
+//! **Send cases** (`ch:on_send(v, f)` / `ch:arm_send(v)`, local channels
+//! only)
+//!
+//! - Ready when `v` can be pushed (room in a buffered channel; for a
+//!   rendezvous channel, once a receiver has taken the offer) or when
+//!   the channel is closed (`sent = false`).  The value enters the
+//!   channel only for the chosen case.
+//!
+//! **Task cases** (`h:on(f)` / `h:arm()`, a `task.spawn` handle)
+//!
+//! - Ready when the task has finished.  The case returns what
+//!   `h:join()` would (`true, ...`, `false, err` with the raw error
+//!   value, or `false, task.CANCELLED`) and marks the handle joined.
+//! - A case that is not chosen leaves the handle unjoined: it can be
+//!   joined, or used in another select, later.
+//! - Building a case from a joined handle raises, and so does a select
+//!   given a case whose handle was joined since.
+//! - A handle that is joined elsewhere (`h:join()`, or another select's
+//!   case) while a select waits on its case: the join takes the result,
+//!   and the waiting select raises "task already joined" once the task
+//!   has finished.
 //!
 //! **select**
 //!
@@ -244,6 +317,17 @@
 //! - `recv` and `select_raw`: a value is delivered when the call returns
 //!   it.  A cancel raised after that, in the caller's code, is the
 //!   caller's to handle, as for any other value it holds.
+//! - A send (`send`, a send case) is delivered when its value is in the
+//!   channel (buffered) or taken by a receiver (rendezvous), and it
+//!   cannot be taken back.  A rendezvous `send` whose offer was taken
+//!   before the cancel was seen returns normally (sent), and a select
+//!   whose send case's offer was taken chooses that case, rather than
+//!   returning the cancel; a cancel seen before the offer was taken
+//!   withdraws it (nothing sent).  An error raised after a send case was
+//!   delivered and before its handler is entered is re-raised; the value
+//!   stays sent.
+//! - A task case is delivered like a received value: if the handler is
+//!   never entered, the handle is left unjoined.
 //! - `select`: a value is delivered when the chosen handler is entered
 //!   with it.  `select` takes the value and calls the handler inside the
 //!   same host call, so a cancel arrives either before the take
@@ -299,8 +383,8 @@
 //!
 //! **Channel**
 //!
-//! - `cap >= 1` (a tokio bounded channel; `cap = 0` is an error, as for
-//!   local channels).  `ch:cap()` is `cap`; `ch:len()` counts the values
+//! - `cap >= 1` (a tokio bounded channel; `cap = 0` is an error: host
+//!   channels have no rendezvous form).  `ch:cap()` is `cap`; `ch:len()` counts the values
 //!   queued by the host plus any put back (below).
 //! - On the Lua side it behaves as a local channel: FIFO, any number of
 //!   Lua receivers, the same `recv` / `try_recv` / `close` / `closed` /
