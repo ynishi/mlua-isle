@@ -223,7 +223,9 @@
 //! - A handler runs as Lua code inside the select and may await (and
 //!   select again); an error it raises is re-raised by `select` with
 //!   its raw value.  While it runs, the other cases are not watched:
-//!   move long work into `task.spawn`.
+//!   move long work into `task.spawn`.  [`Config::preempt_every`] does
+//!   not preempt a handler either: it runs in a coroutine that the
+//!   select's host call creates, not in a root or task (#22).
 //!
 //! **Delivery and cancellation**.  The cancel hook can raise at any
 //! instruction count check, including the instructions between a host
