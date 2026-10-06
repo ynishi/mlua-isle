@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+- Preemption (`Config::preempt_every`) keys its root marks by the Lua
+  thread that is actually running.  They were keyed by
+  `Lua::current_thread`, which for a coroutine `Function::call_async`
+  created returns the owning thread, so roots and tasks shared one key:
+  once a task finished, its root was no longer preempted, and a
+  coroutine that a host function ran with `call_async` was preempted as
+  if it were a root (a sibling task could run in the middle of it).
+
 ## [0.8.0] - 2026-09-25
 
 ### Breaking
