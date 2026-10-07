@@ -31,6 +31,12 @@ communicating via channels.
   `try_checkout` / `checkout_timeout` are async, idle wait uses
   `tokio::sync::Notify`, and each slot owns both an `AsyncIsle` handle
   and its `AsyncIsleDriver` so VMs can be joined on shutdown
+- **Channels and select** (optional, `tokio` feature) — Lua tasks pass
+  values through `task.channel` (buffered or rendezvous) and wait on several
+  sources at once with `task.select` (receive, send, timer, task-finish
+  cases); `runtime::channel` feeds a running Lua loop from a `Send` Rust
+  task, with request / reply, and `runtime::channel_to_host` hands values
+  from Lua back to one
 - **Typed errors** — one error type, `IsleError`; a Lua error arrives as
   `IsleError::Lua(LuaFailure)` with its kind, message, traceback and
   (`serde` feature) the raised value, and a cancel is recognised by value
@@ -78,19 +84,19 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mlua-isle = "0.8"
+mlua-isle = "0.9"
 
 # For async support (includes coroutine execution):
-# mlua-isle = { version = "0.8", features = ["tokio"] }
+# mlua-isle = { version = "0.9", features = ["tokio"] }
 
 # For connection pool:
-# mlua-isle = { version = "0.8", features = ["pool"] }
+# mlua-isle = { version = "0.9", features = ["pool"] }
 
 # Both:
-# mlua-isle = { version = "0.8", features = ["tokio", "pool"] }
+# mlua-isle = { version = "0.9", features = ["tokio", "pool"] }
 
 # The value a Lua error raised, as JSON, on `LuaFailure::value`:
-# mlua-isle = { version = "0.8", features = ["serde"] }
+# mlua-isle = { version = "0.9", features = ["serde"] }
 ```
 
 ### Sync API
@@ -364,6 +370,60 @@ with `vm.add_hook` rather than `Lua::set_hook`, which would replace
 the cancel hook.  The config can also be set without the init closure,
 through `AsyncIsle::builder().config(..)`.
 
+### Channels and select (async)
+
+With the `task` library, Lua tasks pass values through channels and wait
+on several sources with `task.select`; the host feeds a running Lua loop
+through `runtime::channel` and receives from it through
+`runtime::channel_to_host`.  The contracts (ordering, closing, delivery
+under cancellation, rendezvous channels, requests) are in the `runtime`
+module docs.
+
+```rust
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+use mlua_isle::runtime::{channel, channel_to_host, Config, Vm};
+use mlua_isle::AsyncIsle;
+
+let (isle, driver, (events, mut reports)) = AsyncIsle::builder()
+    .spawn_with(|lua| {
+        let vm = Vm::attach(lua, Config::default())?;
+        lua.globals().set("task", vm.task_lib()?)?;
+        let (events, inbox) = channel::<String>(lua, 16)?;
+        let (outbox, reports) = channel_to_host::<String>(lua, 16)?;
+        lua.globals().set("inbox", inbox)?;
+        lua.globals().set("outbox", outbox)?;
+        Ok((events, reports))
+    })
+    .await?;
+
+let main = isle.spawn_coroutine_eval::<()>(
+    r#"
+    while true do
+      local stop = task.select({
+        inbox:on(function(ev, ok)
+          if not ok then return true end   -- the host dropped its Sender
+          outbox:send("got " .. ev)
+          return false
+        end),
+        task.after(1000):on(function()
+          outbox:send("idle")
+          return false
+        end),
+      })
+      if stop then return end
+    end
+    "#,
+);
+events.send("a".to_string()).await?;
+assert_eq!(reports.recv().await.as_deref(), Some("got a"));
+drop(events); // closes `inbox`: the loop returns
+main.await?;
+driver.shutdown().await?;
+# Ok(())
+# }
+```
+
 ### Errors
 
 Every function returns `IsleError`.  A Lua error of a request or root is
@@ -510,7 +570,8 @@ returning.
 | Method | Description |
 |--------|-------------|
 | `AsyncIsle::spawn(init)` | Create a Lua VM, returns `(AsyncIsle, AsyncIsleDriver)` |
-| `AsyncIsle::builder()` | Configure channel capacity / thread name / `Config` |
+| `AsyncIsle::builder()` | Configure channel capacity / thread name / `Config` / how the `Lua` is created (`.lua(factory)`) |
+| `builder.spawn_with(init)` | As `spawn`, and also returns the value `init` built on the VM thread |
 | `isle.eval::<T>(code)` | Evaluate a Lua chunk (async, exclusive), result converted to `T` |
 | `isle.call::<A, T>(func, args)` | Call a global Lua function with `args: A` (async, exclusive) |
 | `isle.exec(closure)` | Run a closure on the Lua thread (async, exclusive), returns its `T` |
@@ -521,6 +582,8 @@ returning.
 | `isle.spawn_exec(closure)` | Returns a cancellable `AsyncTask<T>` |
 | `isle.spawn_coroutine_eval::<T>(code)` | Coroutine eval, returns `AsyncTask<T>` |
 | `isle.spawn_coroutine_call::<A, T>(func, args)` | Coroutine call, returns `AsyncTask<T>` |
+| `isle.function(f)` | Register the Lua function `f` returns, as a `Send + Clone` `IsleFunction` |
+| `isle.call_fn` / `isle.coroutine_call_fn` (and `spawn_*`) | As `call` / `coroutine_call`, with an `IsleFunction` instead of a global name |
 | `driver.shutdown().await` | Graceful shutdown (drains pending coroutines) |
 | `task.cancel()` | Cancel the running task |
 | `task.cancel_token()` | Access the `CancelToken` for sharing |
@@ -533,7 +596,9 @@ returning.
 | `runtime::Vm::attach(lua, config)` | Take over a VM: hook, `Config`, `task` table (no feature) |
 | `vm.config()` / `vm.set_config(config)` | Cancel grace period and preemption (`runtime::Config`) |
 | `vm.add_hook(triggers, f)` / `vm.remove_hook(id)` | Register a Lua hook callback next to the cancel hook |
-| `vm.task_lib()` | Lua `task` library: `spawn` / `join` / `cancel` / `done` / `is_cancelled`; created on first call, not set as a global (`tokio`) |
+| `vm.task_lib()` | Lua `task` library: `spawn` / `join` / `cancel` / `done` / `is_cancelled`, `channel` / `after` / `ticker` / `select` / `select_raw`; created on first call, not set as a global (`tokio`) |
+| `runtime::channel::<T>(lua, cap)` | Host-to-Lua channel: a `Send` `Sender<T>` (with `request` for `Request<Req, Resp>`) and the Lua side (`tokio`) |
+| `runtime::channel_to_host::<T>(lua, cap)` | Lua-to-host channel: the Lua side and a `Send` `Receiver<T>` (`tokio`) |
 | `vm.run(&token, f, args)` | Run a root coroutine; resolves after its tasks ended (`tokio`) |
 | `runtime::cancellable(fut)` | Make an async host function stop at cancel (`tokio`) |
 | `runtime::current_token()` | Token of the running request / task (derive child tokens) |
@@ -564,8 +629,9 @@ public API, is `0.y`.  A `y` bump is a breaking release; the rules:
    signature and gives the one-line migration (add the type annotation,
    or match the new variant).
 3. `#[deprecated]` is used only for renames where the old name forwards
-   to the new one (as the 0.7 in-thread API does to `runtime` in 0.8),
-   and those are removed in the release after.  It is never used to keep
+   to the new one (as the 0.7 in-thread API did to `runtime` in 0.8),
+   and those are removed in the release after (that API was removed in
+   0.9).  It is never used to keep
    a `String` twin of a generic function.
 4. A type that is right long term is preferred over one that avoids the
    bump: while the crate is `0.y`, the bump is the normal release

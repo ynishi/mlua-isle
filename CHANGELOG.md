@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-07
+
+### Breaking
+- The in-thread API of 0.7, deprecated in 0.8.0, is removed, as 0.8.0
+  announced: the root `run_root` / `cancellable` / `current_token`, the
+  `hooks` module (`install`, `configure`, `config`, `add_hook`,
+  `remove_hook`, `CancelConfig`, `HookId`) and the `tasks` module
+  (`install`).  Migration: the table in the crate docs ("Removed in
+  0.9.0"); every name has had its `runtime` replacement since 0.8.0.
+
 ### Added
 - `task` library (`tokio` feature): local channels, one-shot timers and
   `select` (#20, part 1 of #19).  `task.channel(cap)` (`cap >= 1`) with
