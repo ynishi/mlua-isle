@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-07
+
 ### Breaking
 - The in-thread API of 0.7, deprecated in 0.8.0, is removed, as 0.8.0
   announced: the root `run_root` / `cancellable` / `current_token`, the
