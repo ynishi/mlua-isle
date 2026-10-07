@@ -47,6 +47,36 @@
   milliseconds since the ticker started, the newest tick replacing an
   unread one; `tk:stop()` stops it.  Contracts in the `runtime` module
   docs ("Channels, timers and select").
+- Channels to the host (`tokio` feature; #28, part 4 of #19).
+  `runtime::channel_to_host::<T>(lua, cap)` (`cap >= 1`) returns a
+  `LuaChannel`, the `task` library's `Channel` object, send-only on the
+  Lua side (`recv` / `try_recv` / `on` / `arm_recv` raise), and a
+  `Receiver<T>` (`Send`, not `Clone`; `recv`, `try_recv` with the crate's
+  `TryRecvError::{Empty, Closed}`, `close`, `is_closed`).  A Lua send
+  reserves room with tokio's `Sender::reserve_owned` (each waiting Lua
+  sender has its own place in tokio's queue), then converts the value
+  with `FromLua` on the VM thread and queues it; a value that fails to
+  convert raises in the sender and gives the room back.  `send` waits
+  while full, `try_send` returns `false`, `on_send` / `arm_send` are
+  ready when room is reserved (with `default`: when there is room now);
+  all raise or report `sent = false` once the channel is closed
+  (`rx.close()`, `rx` dropped, or Lua `close`, after which the host
+  receives the queued values and then `None`).  A cancelled waiting send
+  (or select) releases its reservation.  Contracts in the `runtime`
+  module docs ("Channels to the host").
+- `AsyncIsle` function handles (#28): `AsyncIsle::function(f)` runs `f`
+  on the Lua thread and keeps the function it returns as an
+  `IsleFunction` (`Send + Clone`), called with `call_fn` /
+  `coroutine_call_fn` (and `spawn_call_fn` / `spawn_coroutine_call_fn`).
+  A handle used with another isle returns the new
+  `IsleError::WrongIsle`.
+- `AsyncIsleBuilder::spawn_with(init)` (#28): `init` returns a `Send`
+  value created on the Lua thread (a host channel's `Sender`, a channel
+  to the host's `Receiver`), returned as `(AsyncIsle, AsyncIsleDriver,
+  T)`.  `spawn` is `spawn_with` returning `()`.
+- `AsyncIsleBuilder::lua(factory)` (#28): create the isle's `Lua` state
+  with `factory` (on the Lua thread) instead of `Lua::new()`, e.g.
+  `Lua::unsafe_new()`.  The rest of the setup is unchanged.
 
 ### Changed
 - The cancel hook no longer raises a cancel while mlua runs the Lua code

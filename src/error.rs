@@ -71,6 +71,13 @@ pub enum IsleError {
     #[error("channel full (backpressure)")]
     ChannelFull,
 
+    /// An [`IsleFunction`](crate::IsleFunction) was used with an
+    /// [`AsyncIsle`](crate::AsyncIsle) other than the one that created
+    /// it.  Nothing was sent to either isle.
+    #[cfg(feature = "tokio")]
+    #[error("function handle belongs to another isle")]
+    WrongIsle,
+
     /// Failed to receive response from the Lua thread.
     ///
     /// The response channel was dropped before a result was sent.  This

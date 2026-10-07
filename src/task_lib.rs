@@ -159,10 +159,26 @@ end
 
 task.select_raw = select_raw
 
--- The constructor `runtime::channel` wraps a host channel with: the
--- same `Channel` object as `task.channel`.
-local function wrap_channel(c)
-  return setmetatable({ _c = c }, Channel)
+-- A channel to the host (`runtime::channel_to_host`) is a `Channel`
+-- (send-only).
+local SendChannel = setmetatable({}, { __index = Channel })
+SendChannel.__index = SendChannel
+
+local function refuse(method)
+  return function()
+    error(method .. ": channel is send-only (a channel to the host; the host receives)", 2)
+  end
+end
+SendChannel.recv = refuse("ch:recv")
+SendChannel.try_recv = refuse("ch:try_recv")
+SendChannel.on = refuse("ch:on")
+SendChannel.arm_recv = refuse("ch:arm_recv")
+
+-- The constructor `runtime::channel` wraps a host channel with (the
+-- same `Channel` object as `task.channel`), and `runtime::channel_to_host`
+-- a channel to the host (`send_only = true`).
+local function wrap_channel(c, send_only)
+  return setmetatable({ _c = c }, send_only and SendChannel or Channel)
 end
 
 return task, wrap_channel
@@ -358,6 +374,17 @@ fn check_sendable(method: &str, chan: &Chan) -> mlua::Result<()> {
     }
 }
 
+/// The error of a receive from a send-only channel (a channel to the
+/// host), `Ok` otherwise.
+fn check_receivable(method: &str, chan: &Chan) -> mlua::Result<()> {
+    match chan::send_only(chan) {
+        None => Ok(()),
+        Some(why) => Err(mlua::Error::runtime(format!(
+            "{method}: channel is send-only ({why})"
+        ))),
+    }
+}
+
 /// The period of `task.ticker(ms)`.
 fn ticker_period(ms: f64) -> mlua::Result<Duration> {
     if ms.is_nan() || ms <= 0.0 {
@@ -418,13 +445,13 @@ fn channel_parts(lua: &Lua, reg: Rc<Registry>) -> mlua::Result<Table> {
 
     raw.set(
         "send",
-        lua.create_async_function(|_, (ud, v): (AnyUserData, Value)| {
+        lua.create_async_function(|lua, (ud, v): (AnyUserData, Value)| {
             let chan = select::chan_of(&ud);
             async move {
                 let chan = chan?;
                 check_sendable("ch:send", &chan)?;
                 let mut send = Sending::new(chan, v, None);
-                select::wait_send(&mut send)
+                select::wait_send(&mut send, &lua)
                     .await?
                     .map_err(|_| closed_error("ch:send"))
             }
@@ -433,10 +460,10 @@ fn channel_parts(lua: &Lua, reg: Rc<Registry>) -> mlua::Result<Table> {
 
     raw.set(
         "try_send",
-        lua.create_function(|_, (ud, v): (AnyUserData, Value)| {
+        lua.create_function(|lua, (ud, v): (AnyUserData, Value)| {
             let chan = select::chan_of(&ud)?;
             check_sendable("ch:try_send", &chan)?;
-            chan::try_send(&chan, v).map_err(|_| closed_error("ch:try_send"))
+            chan::try_send(&chan, lua, v)?.map_err(|_| closed_error("ch:try_send"))
         })?,
     )?;
 
@@ -445,7 +472,9 @@ fn channel_parts(lua: &Lua, reg: Rc<Registry>) -> mlua::Result<Table> {
         lua.create_async_function(|lua, ud: AnyUserData| {
             let chan = select::chan_of(&ud);
             async move {
-                let mut recv = Receiving::new(chan?, None);
+                let chan = chan?;
+                check_receivable("ch:recv", &chan)?;
+                let mut recv = Receiving::new(chan, None);
                 let got = cancellable(std::future::poll_fn(|cx| recv.poll(cx, &lua))).await?;
                 Ok(select::recv_values(got))
             }
@@ -455,7 +484,9 @@ fn channel_parts(lua: &Lua, reg: Rc<Registry>) -> mlua::Result<Table> {
     raw.set(
         "try_recv",
         lua.create_function(|lua, ud: AnyUserData| {
-            Ok(match chan::try_recv(&select::chan_of(&ud)?, lua)? {
+            let chan = select::chan_of(&ud)?;
+            check_receivable("ch:try_recv", &chan)?;
+            Ok(match chan::try_recv(&chan, lua)? {
                 chan::TryRecv::Value(v) => (v, true, true),
                 chan::TryRecv::Closed => (Value::Nil, false, true),
                 chan::TryRecv::Empty => (Value::Nil, false, false),

@@ -53,7 +53,7 @@ impl mlua::UserData for TimerUd {}
 pub(crate) enum Arm {
     /// Receive from a channel (local or host).
     Recv(Receiving),
-    /// Send a value into a local channel.
+    /// Send a value into a local channel or a channel to the host.
     Send(Sending),
     /// Wait for a timer.  The `Sleep` is created on the first poll that
     /// finds the timer not ready yet.
@@ -134,7 +134,8 @@ impl Arm {
     /// Values: `v, true` (a value) or `nil, false` (closed and empty)
     /// for a receive; `true` (sent) or `false` (closed) for a send; none
     /// for a timer; what `join` returns for a task.  A host value that
-    /// fails to convert is `Ready(Err)` (the value is dropped).
+    /// fails to convert is `Ready(Err)` (the value is dropped), and so
+    /// is a value sent to the host that fails to convert (not sent).
     pub(crate) fn poll_take(
         &mut self,
         cx: &mut Context<'_>,
@@ -142,7 +143,9 @@ impl Arm {
     ) -> Poll<mlua::Result<MultiValue>> {
         match self {
             Arm::Recv(recv) => recv.poll(cx, lua).map(|got| got.map(recv_values)),
-            Arm::Send(send) => send.poll(cx).map(|r| Ok(send_values(r.is_ok()))),
+            Arm::Send(send) => send
+                .poll(cx, lua)
+                .map(|r| r.map(|sent| send_values(sent.is_ok()))),
             Arm::Timer(timer, sleep) => {
                 if Instant::now() >= timer.deadline {
                     return Poll::Ready(Ok(MultiValue::new()));
@@ -249,7 +252,9 @@ impl SelectFuture {
     /// `None`, every arm has been withdrawn.
     ///
     /// A rendezvous send case is ready here when a receiver is waiting:
-    /// its value goes to that receiver, as with `try_send`.
+    /// its value goes to that receiver, as with `try_send`.  A send case
+    /// on a channel to the host is ready when there is room now
+    /// (`try_reserve`).
     pub(crate) fn poll_now(&mut self) -> Option<mlua::Result<(usize, MultiValue)>> {
         for arm in &mut self.arms {
             if let Arm::Send(send) = arm {
@@ -315,9 +320,13 @@ pub(crate) async fn wait_select(sel: &mut SelectFuture) -> mlua::Result<(usize, 
 /// send whose rendezvous offer a receiver took before the cancel was
 /// seen returns as sent (#19, Open 5): a completed send returns
 /// normally.
-pub(crate) async fn wait_send(send: &mut Sending) -> mlua::Result<Result<(), Closed>> {
+///
+/// A send to the host is delivered in the poll that reserves its room
+/// (it converts and sends the value at once): a cancel seen first drops
+/// the reservation, and nothing is sent.
+pub(crate) async fn wait_send(send: &mut Sending, lua: &Lua) -> mlua::Result<Result<(), Closed>> {
     match crate::hook::current_token() {
-        None => Ok(std::future::poll_fn(|cx| send.poll(cx)).await),
+        None => std::future::poll_fn(|cx| send.poll(cx, lua)).await,
         Some(token) => tokio::select! {
             biased;
             _ = token.cancelled() => {
@@ -327,7 +336,7 @@ pub(crate) async fn wait_send(send: &mut Sending) -> mlua::Result<Result<(), Clo
                     Err(crate::error::cancel_error())
                 }
             }
-            out = std::future::poll_fn(|cx| send.poll(cx)) => Ok(out),
+            out = std::future::poll_fn(|cx| send.poll(cx, lua)) => out,
         },
     }
 }
@@ -380,7 +389,13 @@ pub(crate) fn read_cases(
         let target: Value = case.get("target")?;
         let arm = match (kind.as_str(), target) {
             ("recv", Value::UserData(ud)) if ud.is::<ChanUd>() => {
-                Arm::Recv(Receiving::new(chan_of(&ud)?, Some(mark.clone())))
+                let chan = chan_of(&ud)?;
+                if let Some(why) = chan::send_only(&chan) {
+                    return Err(mlua::Error::runtime(format!(
+                        "{name}: case {n}: channel is send-only ({why})"
+                    )));
+                }
+                Arm::Recv(Receiving::new(chan, Some(mark.clone())))
             }
             ("send", Value::UserData(ud)) if ud.is::<ChanUd>() => {
                 let chan = chan_of(&ud)?;
