@@ -122,7 +122,7 @@ pub use task::Task;
 pub use pool::{IslePool, PoolConfig, PoolStrategy, PooledIsle};
 
 #[cfg(feature = "tokio")]
-pub use async_isle::{AsyncIsle, AsyncIsleBuilder, AsyncIsleDriver};
+pub use async_isle::{AsyncIsle, AsyncIsleBuilder, AsyncIsleDriver, IsleFunction};
 #[cfg(all(feature = "pool", feature = "tokio"))]
 pub use async_pool::{AsyncIslePool, AsyncPooledIsle};
 #[cfg(feature = "tokio")]

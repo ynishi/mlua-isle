@@ -128,8 +128,9 @@ where
 /// cancellation) are in the
 /// [runtime module docs](crate::runtime#channels-to-the-host).
 ///
-/// With an [`AsyncIsle`](crate::AsyncIsle), create the channel in a
-/// request and return the `Receiver` from it:
+/// With an [`AsyncIsle`](crate::AsyncIsle), create the channel in the
+/// init closure and return the `Receiver` with
+/// [`spawn_with`](crate::AsyncIsleBuilder::spawn_with):
 ///
 /// ```rust
 /// # #[tokio::main]
@@ -137,13 +138,10 @@ where
 /// use mlua_isle::runtime::{channel_to_host, Config, Vm};
 /// use mlua_isle::AsyncIsle;
 ///
-/// let (isle, driver) = AsyncIsle::spawn(|lua| {
-///     let vm = Vm::attach(lua, Config::default())?;
-///     lua.globals().set("task", vm.task_lib()?)
-/// })
-/// .await?;
-/// let mut reports = isle
-///     .exec(|lua| {
+/// let (isle, driver, mut reports) = AsyncIsle::builder()
+///     .spawn_with(|lua| {
+///         let vm = Vm::attach(lua, Config::default())?;
+///         lua.globals().set("task", vm.task_lib()?)?;
 ///         let (ch, rx) = channel_to_host::<String>(lua, 16)?;
 ///         lua.globals().set("reports", ch)?;
 ///         Ok(rx)

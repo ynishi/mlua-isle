@@ -90,6 +90,25 @@
 //! | Simple one-shot evaluation | `eval` / `call` |
 //! | Multiple concurrent Lua tasks with async I/O | `coroutine_eval` / `coroutine_call` |
 //! | Closure with direct `&Lua` access | `exec` |
+//! | Calling a function that is not a global (a module's) | `function`, then `call_fn` / `coroutine_call_fn` |
+//!
+//! ## Function handles
+//!
+//! `call` / `coroutine_call` name a global.  For any other function (a
+//! field of a `require`d module, a closure), [`AsyncIsle::function`]
+//! runs a closure on the Lua thread that returns the function and keeps
+//! it as an [`IsleFunction`]: a `Send + Clone` handle that
+//! [`call_fn`](AsyncIsle::call_fn) and
+//! [`coroutine_call_fn`](AsyncIsle::coroutine_call_fn) call.  A handle
+//! belongs to the isle that created it; any other isle refuses it with
+//! [`IsleError::WrongIsle`].
+//!
+//! ## Setting up the VM
+//!
+//! [`AsyncIsleBuilder::spawn_with`] returns a value that the init
+//! closure created on the Lua thread (a host channel's `Sender`, a
+//! channel to the host's `Receiver`), and [`AsyncIsleBuilder::lua`]
+//! chooses how the `Lua` state is created (default [`mlua::Lua::new`]).
 //!
 //! ## Mixing sync and coroutine requests
 //!
@@ -142,6 +161,8 @@ use crate::hook::CancelToken;
 use crate::runtime::Config;
 use crate::thread;
 use crate::Request;
+use std::fmt;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 /// Default capacity for the request channel.
@@ -173,6 +194,36 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone)]
 pub struct AsyncIsle {
     tx: tokio::sync::mpsc::Sender<Request>,
+    /// The isle's identity, shared by its handles and the
+    /// [`IsleFunction`]s it created; compared by pointer.
+    id: Arc<IsleId>,
+}
+
+/// The identity of one isle (see [`AsyncIsle`]'s `id`).
+struct IsleId;
+
+/// A handle to a Lua function in one [`AsyncIsle`], created with
+/// [`AsyncIsle::function`] and called with
+/// [`call_fn`](AsyncIsle::call_fn) /
+/// [`coroutine_call_fn`](AsyncIsle::coroutine_call_fn).
+///
+/// `Send + Clone`: clone it into as many tokio tasks as needed; the
+/// clones share one registry entry.  The function stays alive in the
+/// VM while a clone exists; the entry is released (on the Lua thread,
+/// at a later request) when the last clone is dropped.
+///
+/// It belongs to the isle that created it: using it with another isle
+/// returns [`IsleError::WrongIsle`].
+#[derive(Clone)]
+pub struct IsleFunction {
+    key: Arc<mlua::RegistryKey>,
+    isle: Arc<IsleId>,
+}
+
+impl fmt::Debug for IsleFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IsleFunction").finish_non_exhaustive()
+    }
 }
 
 /// Lifecycle driver for the async Lua VM thread.
@@ -244,6 +295,18 @@ pub struct AsyncIsleBuilder {
     channel_capacity: usize,
     thread_name: String,
     config: Option<Config>,
+    lua: Option<LuaFactory>,
+}
+
+/// How the isle's `Lua` state is created (see [`AsyncIsleBuilder::lua`]).
+type LuaFactory = Box<dyn FnOnce() -> mlua::Lua + Send>;
+
+/// The settings `spawn_inner` takes from the builder.
+struct Settings {
+    channel_capacity: usize,
+    thread_name: String,
+    config: Option<Config>,
+    lua: Option<LuaFactory>,
 }
 
 impl Default for AsyncIsleBuilder {
@@ -252,6 +315,7 @@ impl Default for AsyncIsleBuilder {
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
             thread_name: "mlua-isle-async".into(),
             config: None,
+            lua: None,
         }
     }
 }
@@ -310,6 +374,52 @@ impl AsyncIsleBuilder {
         self
     }
 
+    /// Create the isle's `Lua` state with `factory` instead of
+    /// [`mlua::Lua::new`].
+    ///
+    /// `factory` runs on the Lua thread, before anything else touches
+    /// the state.  The rest of the setup is unchanged: the crate's
+    /// protection parts are installed, then the init closure runs, then
+    /// the VM is attached (with [`config`](Self::config), if set).  A
+    /// panic in `factory` is [`IsleError::ThreadPanic`], as for the init
+    /// closure.
+    ///
+    /// The state must keep mlua's default
+    /// `LuaOptions::catch_rust_panics = true` (see
+    /// [`Vm::attach`](crate::runtime::Vm::attach)), and its `xpcall`
+    /// global must be a function when the protection parts are
+    /// installed.
+    ///
+    /// ```rust
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use mlua_isle::AsyncIsle;
+    ///
+    /// // Only the base, string and table libraries.
+    /// let (isle, driver) = AsyncIsle::builder()
+    ///     .lua(|| {
+    ///         mlua::Lua::new_with(
+    ///             mlua::StdLib::STRING | mlua::StdLib::TABLE,
+    ///             mlua::LuaOptions::default(),
+    ///         )
+    ///         .expect("safe libraries")
+    ///     })
+    ///     .spawn(|_| Ok(()))
+    ///     .await?;
+    /// let has_io: bool = isle.eval("return io ~= nil").await?;
+    /// assert!(!has_io);
+    /// driver.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn lua<F>(mut self, factory: F) -> Self
+    where
+        F: FnOnce() -> mlua::Lua + Send + 'static,
+    {
+        self.lua = Some(Box::new(factory));
+        self
+    }
+
     /// Spawn the Lua VM with the configured settings.
     ///
     /// See [`AsyncIsle::spawn`] for details.
@@ -317,7 +427,70 @@ impl AsyncIsleBuilder {
     where
         F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
     {
-        AsyncIsle::spawn_inner(init, self.channel_capacity, self.thread_name, self.config).await
+        let (isle, driver, ()) = self.spawn_with(init).await?;
+        Ok((isle, driver))
+    }
+
+    /// Spawn the Lua VM, returning the value `init` returns.
+    ///
+    /// As [`spawn`](Self::spawn), except that `init` returns a value
+    /// created on the Lua thread (it must be `Send`), returned with the
+    /// handle and the driver once the VM is attached.  The usual one is
+    /// the host end of a channel: a host channel's
+    /// [`Sender`](crate::runtime::Sender), or a channel to the host's
+    /// [`Receiver`](crate::runtime::Receiver).  Those need the VM
+    /// attached and its `task` library created, so `init` attaches it
+    /// (the isle re-attaches after `init` and keeps the table).
+    ///
+    /// ```rust
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use mlua_isle::runtime::{channel, Config, Vm};
+    /// use mlua_isle::AsyncIsle;
+    ///
+    /// let (isle, driver, events) = AsyncIsle::builder()
+    ///     .spawn_with(|lua| {
+    ///         let vm = Vm::attach(lua, Config::default())?;
+    ///         lua.globals().set("task", vm.task_lib()?)?;
+    ///         let (tx, ch) = channel::<i64>(lua, 16)?;
+    ///         lua.globals().set("events", ch)?;
+    ///         Ok(tx)
+    ///     })
+    ///     .await?;
+    ///
+    /// tokio::spawn(async move {
+    ///     events.send(42).await.unwrap();
+    /// });
+    /// let v: i64 = isle.coroutine_eval("return (events:recv())").await?;
+    /// assert_eq!(v, 42);
+    /// driver.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`AsyncIsle::spawn`]: [`IsleError::Init`] if `init` fails, and
+    /// [`IsleError::ThreadPanic`] if it panics.  The value `init`
+    /// returned is then dropped on the Lua thread.
+    pub async fn spawn_with<F, T>(
+        self,
+        init: F,
+    ) -> Result<(AsyncIsle, AsyncIsleDriver, T), IsleError>
+    where
+        F: FnOnce(&mlua::Lua) -> Result<T, mlua::Error> + Send + 'static,
+        T: Send + 'static,
+    {
+        AsyncIsle::spawn_inner(
+            init,
+            Settings {
+                channel_capacity: self.channel_capacity,
+                thread_name: self.thread_name,
+                config: self.config,
+                lua: self.lua,
+            },
+        )
+        .await
     }
 }
 
@@ -363,26 +536,25 @@ impl AsyncIsle {
     where
         F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
     {
-        Self::spawn_inner(
-            init,
-            DEFAULT_CHANNEL_CAPACITY,
-            "mlua-isle-async".into(),
-            None,
-        )
-        .await
+        Self::builder().spawn(init).await
     }
 
-    async fn spawn_inner<F>(
+    async fn spawn_inner<F, T>(
         init: F,
-        channel_capacity: usize,
-        thread_name: String,
-        config: Option<Config>,
-    ) -> Result<(Self, AsyncIsleDriver), IsleError>
+        settings: Settings,
+    ) -> Result<(Self, AsyncIsleDriver, T), IsleError>
     where
-        F: FnOnce(&mlua::Lua) -> Result<(), mlua::Error> + Send + 'static,
+        F: FnOnce(&mlua::Lua) -> Result<T, mlua::Error> + Send + 'static,
+        T: Send + 'static,
     {
+        let Settings {
+            channel_capacity,
+            thread_name,
+            config,
+            lua: factory,
+        } = settings;
         let (tx, rx) = tokio::sync::mpsc::channel::<Request>(channel_capacity);
-        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<(), IsleError>>();
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<T, IsleError>>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let join = std::thread::Builder::new()
@@ -407,17 +579,21 @@ impl AsyncIsle {
                     }
                 };
 
-                let lua = mlua::Lua::new();
+                let lua = match factory {
+                    Some(factory) => factory(),
+                    None => mlua::Lua::new(),
+                };
                 // Before `init`: captures `xpcall` while the globals are
                 // intact (see `protect`).
                 match crate::protect::install(&lua)
                     .and_then(|()| {
                         init(&lua).map_err(|e| IsleError::Init(LuaFailure::from_mlua(&e)))
                     })
-                    .and_then(|()| crate::runtime::attach_after_init(&lua, config).map(drop))
-                {
-                    Ok(()) => {
-                        let _ = init_tx.send(Ok(()));
+                    .and_then(|value| {
+                        crate::runtime::attach_after_init(&lua, config).map(|_| value)
+                    }) {
+                    Ok(value) => {
+                        let _ = init_tx.send(Ok(value));
                         run_async_loop(lua, rx, rt);
                     }
                     Err(e) => {
@@ -432,7 +608,7 @@ impl AsyncIsle {
             .map_err(|e| IsleError::Init(LuaFailure::from_mlua(&mlua::Error::external(e))))?;
 
         // A closed channel means the thread ended without reporting: the
-        // init closure panicked.  `done_tx` is dropped by the same
+        // init closure (or the `lua` factory) panicked.  `done_tx` is dropped by the same
         // unwind, so after it the join returns at once.
         let init_result = init_rx.await;
         let init_result = match init_result {
@@ -445,16 +621,19 @@ impl AsyncIsle {
                 ));
             }
         };
-        init_result?;
+        let value = init_result?;
 
-        let handle = Self { tx: tx.clone() };
+        let handle = Self {
+            tx: tx.clone(),
+            id: Arc::new(IsleId),
+        };
         let driver = AsyncIsleDriver {
             tx,
             done_rx: Some(done_rx),
             join: Some(join),
         };
 
-        Ok((handle, driver))
+        Ok((handle, driver, value))
     }
 
     /// Evaluate a Lua chunk (sync execution on the Lua thread) and
@@ -658,6 +837,140 @@ impl AsyncIsle {
         self.submit_coroutine(move |lua, cancel| async move {
             execute_coroutine_call(&lua, &func, args, &cancel).await
         })
+    }
+
+    /// Run `f` on the Lua thread (a sync request, as
+    /// [`exec`](Self::exec)) and keep the function it returns as an
+    /// [`IsleFunction`] of this isle.
+    ///
+    /// Use it for a function that is not a global (a field of a
+    /// `require`d module, a closure); call the handle with
+    /// [`call_fn`](Self::call_fn) or
+    /// [`coroutine_call_fn`](Self::coroutine_call_fn).
+    ///
+    /// ```rust
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use mlua_isle::AsyncIsle;
+    ///
+    /// let (isle, driver) = AsyncIsle::spawn(|lua| {
+    ///     lua.load("package.preload.geometry = function()
+    ///                 return { area = function(w, h) return w * h end }
+    ///               end")
+    ///         .exec()
+    /// })
+    /// .await?;
+    /// let area = isle
+    ///     .function(|lua| lua.load("return require('geometry').area").eval())
+    ///     .await?;
+    /// let a: i64 = isle.call_fn(&area, (3, 4)).await?;
+    /// assert_eq!(a, 12);
+    /// driver.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`exec`](Self::exec); a Lua error raised in `f` (or
+    /// a value that is not a function) is [`IsleError::Lua`].
+    pub async fn function<F>(&self, f: F) -> Result<IsleFunction, IsleError>
+    where
+        F: FnOnce(&mlua::Lua) -> mlua::Result<mlua::Function> + Send + 'static,
+    {
+        let key = self
+            .exec(move |lua| {
+                let func = f(lua)?;
+                Ok(lua.create_registry_value(func)?)
+            })
+            .await?;
+        Ok(IsleFunction {
+            key: Arc::new(key),
+            isle: self.id.clone(),
+        })
+    }
+
+    /// Call the function `func` (sync execution on the Lua thread) and
+    /// convert its return values to `T`.
+    ///
+    /// As [`call`](Self::call), with a function handle instead of a
+    /// global's name.
+    ///
+    /// # Errors
+    ///
+    /// [`IsleError::WrongIsle`] when `func` was created by another isle;
+    /// otherwise the errors of [`call`](Self::call).
+    ///
+    /// Equivalent to `spawn_call_fn(func, args).await`.
+    pub async fn call_fn<A, T>(&self, func: &IsleFunction, args: A) -> Result<T, IsleError>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        self.spawn_call_fn(func, args).await
+    }
+
+    /// Call the function `func`, returning a cancellable [`AsyncTask`].
+    pub fn spawn_call_fn<A, T>(&self, func: &IsleFunction, args: A) -> AsyncTask<T>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        if let Some(task) = self.refuse_foreign(func) {
+            return task;
+        }
+        let key = func.key.clone();
+        self.submit_sync(move |lua, cancel| thread::execute_call_fn(lua, &key, args, cancel))
+    }
+
+    /// Call the function `func` as a cooperative coroutine and convert
+    /// its return values to `T`.
+    ///
+    /// As [`coroutine_call`](Self::coroutine_call), with a function
+    /// handle instead of a global's name.
+    ///
+    /// # Errors
+    ///
+    /// [`IsleError::WrongIsle`] when `func` was created by another isle;
+    /// otherwise the errors of [`coroutine_call`](Self::coroutine_call).
+    ///
+    /// Equivalent to `spawn_coroutine_call_fn(func, args).await`.
+    pub async fn coroutine_call_fn<A, T>(
+        &self,
+        func: &IsleFunction,
+        args: A,
+    ) -> Result<T, IsleError>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        self.spawn_coroutine_call_fn(func, args).await
+    }
+
+    /// Call the function `func` as a cooperative coroutine, returning a
+    /// cancellable [`AsyncTask`].
+    pub fn spawn_coroutine_call_fn<A, T>(&self, func: &IsleFunction, args: A) -> AsyncTask<T>
+    where
+        A: mlua::IntoLuaMulti + Send + 'static,
+        T: mlua::FromLuaMulti + Send + 'static,
+    {
+        if let Some(task) = self.refuse_foreign(func) {
+            return task;
+        }
+        let key = func.key.clone();
+        self.submit_coroutine(move |lua, cancel| async move {
+            execute_coroutine_call_fn(&lua, &key, args, &cancel).await
+        })
+    }
+
+    /// A task that fails with [`IsleError::WrongIsle`] when `func` was
+    /// created by another isle.
+    fn refuse_foreign<T>(&self, func: &IsleFunction) -> Option<AsyncTask<T>> {
+        if Arc::ptr_eq(&func.isle, &self.id) {
+            None
+        } else {
+            Some(make_error_task(IsleError::WrongIsle, CancelToken::new()))
+        }
     }
 
     /// Send a job that runs `run` inline on the Lua thread (a sync
@@ -930,6 +1243,21 @@ async fn execute_coroutine_call<A: mlua::IntoLuaMulti, T: mlua::FromLuaMulti>(
     cancel: &CancelToken,
 ) -> Result<T, IsleError> {
     let func = thread::global_function(lua, func_name)?;
+    let multi = args.into_lua_multi(lua)?;
+    let values = vm(lua)?.run(cancel, func, multi).await?;
+    convert(lua, values, cancel)
+}
+
+/// Call the function stored under `key` (an [`IsleFunction`]) as a
+/// coroutine.  See [`execute_coroutine_eval`] for cancellation
+/// semantics.
+async fn execute_coroutine_call_fn<A: mlua::IntoLuaMulti, T: mlua::FromLuaMulti>(
+    lua: &mlua::Lua,
+    key: &mlua::RegistryKey,
+    args: A,
+    cancel: &CancelToken,
+) -> Result<T, IsleError> {
+    let func: mlua::Function = lua.registry_value(key)?;
     let multi = args.into_lua_multi(lua)?;
     let values = vm(lua)?.run(cancel, func, multi).await?;
     convert(lua, values, cancel)

@@ -99,6 +99,34 @@ pub(crate) fn execute_call<A: mlua::IntoLuaMulti, T: mlua::FromLuaMulti>(
     let _enter = hook::EnterGuard::new(cancel);
 
     let func = global_function(lua, func_name)?;
+    call_function(lua, func, args, cancel)
+}
+
+/// Call the function stored under `key` (an `IsleFunction`) with
+/// `args` as a sync call and convert its return values to `T`.
+#[cfg(feature = "tokio")]
+pub(crate) fn execute_call_fn<A: mlua::IntoLuaMulti, T: mlua::FromLuaMulti>(
+    lua: &mlua::Lua,
+    key: &mlua::RegistryKey,
+    args: A,
+    cancel: &hook::CancelToken,
+) -> Result<T, IsleError> {
+    crate::runtime::ensure_attached(lua)?;
+    let _enter = hook::EnterGuard::new(cancel);
+
+    let func: mlua::Function = lua.registry_value(key)?;
+    call_function(lua, func, args, cancel)
+}
+
+/// Convert `args`, call `func` under the crate's message handler and
+/// convert its return values to `T`.  The caller has entered the
+/// request's token.
+fn call_function<A: mlua::IntoLuaMulti, T: mlua::FromLuaMulti>(
+    lua: &mlua::Lua,
+    func: mlua::Function,
+    args: A,
+    cancel: &hook::CancelToken,
+) -> Result<T, IsleError> {
     let multi = args.into_lua_multi(lua)?;
     let values = cancelled_wins(protect::call(lua, func, multi), cancel)?;
     Ok(T::from_lua_multi(values, lua)?)

@@ -472,8 +472,9 @@
 //! ```
 //!
 //! Call `channel_to_host` on the VM thread, after [`Vm::attach`] and
-//! `Vm::task_lib`; for an `AsyncIsle`, in an `exec` request that returns
-//! the `Receiver` (example on `channel_to_host`).
+//! `Vm::task_lib`; for an `AsyncIsle`, in the init closure of
+//! `AsyncIsleBuilder::spawn_with`, which returns the `Receiver` (example
+//! on `channel_to_host`), or in an `exec` request that returns it.
 //!
 //! - `cap >= 1` (a tokio bounded channel; `cap = 0` is an error).  One
 //!   host receiver; any number of Lua senders (tasks, selects).
