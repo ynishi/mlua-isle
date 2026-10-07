@@ -931,6 +931,7 @@ pub(crate) fn ensure_attached(lua: &Lua) -> Result<(), IsleError> {
 
 /// The [`Vm`] of `lua`, attaching it with its stored config (the
 /// default if none was set) when it is not attached yet.
+#[cfg(feature = "tokio")]
 pub(crate) fn of_or_attach(lua: &Lua) -> Result<Vm, IsleError> {
     match Vm::of(lua) {
         Some(vm) => Ok(vm),

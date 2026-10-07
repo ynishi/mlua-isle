@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+- Building without the `tokio` feature no longer warns that
+  `runtime::of_or_attach` is unused (0.9.0 removed its last caller outside
+  that feature).
+
 ## [0.9.0] - 2026-10-07
 
 ### Breaking
