@@ -1,11 +1,13 @@
 //! Host channels: a `Send` [`Sender`] that host code (any thread, any
-//! task) uses to feed values into a running Lua loop, and [`Request`]s
-//! that Lua answers.
+//! task) uses to feed values into a running Lua loop, [`Request`]s
+//! that Lua answers, and channels to the host: a `Send` [`Receiver`]
+//! that takes the values Lua sends.
 //!
 //! Re-exported from [`runtime`](crate::runtime) and documented in its
-//! module docs ("Host channels and requests").  The Lua side is the
-//! `task` library's `Channel` object over a host channel
-//! ([`chan::new_host`]); this module is the host side.
+//! module docs ("Host channels and requests", "Channels to the host").
+//! The Lua side is the `task` library's `Channel` object over a host
+//! channel ([`chan::new_host`]) or a channel to the host
+//! ([`chan::new_to_host`]); this module is the host side.
 
 use crate::chan::{self, ChanUd};
 use crate::error::{IsleError, LuaErrorKind, LuaFailure};
@@ -113,9 +115,93 @@ where
     Ok((Sender { inner: tx }, LuaChannel(table)))
 }
 
-/// The Lua side of a host channel: the `task` library's `Channel`
-/// object, receive-only.  Set it where Lua code can reach it (it
-/// implements [`IntoLua`]), e.g. `lua.globals().set("events", ch)`.
+/// Create a channel to the host: its Lua side, a `task` library
+/// `Channel` object that is send-only, and a [`Receiver`] for the host.
+///
+/// Call it on the VM thread, after [`Vm::attach`] and [`Vm::task_lib`].
+/// The [`Receiver`] is `Send` (not `Clone`); move it to any thread or
+/// task.  Each value Lua sends is converted to `T` (`T: FromLua`) on the
+/// VM thread, once room for it has been reserved: a value that fails to
+/// convert raises in the Lua sender and is not sent.
+///
+/// The contracts (capacity, waiting, closing, conversion errors,
+/// cancellation) are in the
+/// [runtime module docs](crate::runtime#channels-to-the-host).
+///
+/// With an [`AsyncIsle`](crate::AsyncIsle), create the channel in a
+/// request and return the `Receiver` from it:
+///
+/// ```rust
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use mlua_isle::runtime::{channel_to_host, Config, Vm};
+/// use mlua_isle::AsyncIsle;
+///
+/// let (isle, driver) = AsyncIsle::spawn(|lua| {
+///     let vm = Vm::attach(lua, Config::default())?;
+///     lua.globals().set("task", vm.task_lib()?)
+/// })
+/// .await?;
+/// let mut reports = isle
+///     .exec(|lua| {
+///         let (ch, rx) = channel_to_host::<String>(lua, 16)?;
+///         lua.globals().set("reports", ch)?;
+///         Ok(rx)
+///     })
+///     .await?;
+///
+/// let consumer = tokio::spawn(async move {
+///     let mut got = Vec::new();
+///     while let Some(r) = reports.recv().await {
+///         got.push(r);
+///     }
+///     got
+/// });
+/// isle.coroutine_eval::<()>(
+///     "for i = 1, 3 do reports:send('report ' .. i) end
+///      reports:close()",
+/// )
+/// .await?;
+/// assert_eq!(consumer.await?, ["report 1", "report 2", "report 3"]);
+/// driver.shutdown().await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// [`IsleError::Init`] with [`LuaErrorKind::External`] when the VM is
+/// not attached, when its `task` library was not created, or when
+/// `cap` is 0 or larger than tokio's bounded channel allows.  A Lua
+/// error building the object (the VM's memory limit) is
+/// [`IsleError::Lua`].
+pub fn channel_to_host<T>(lua: &Lua, cap: usize) -> Result<(LuaChannel, Receiver<T>), IsleError>
+where
+    T: FromLua + Send + 'static,
+{
+    let vm = Vm::of(lua).ok_or_else(|| {
+        setup_error("runtime::channel_to_host: the VM is not attached (call Vm::attach first)")
+    })?;
+    let ctor = vm.channel_ctor()?.ok_or_else(|| {
+        setup_error(
+            "runtime::channel_to_host: the VM's task library was not created (call Vm::task_lib first)",
+        )
+    })?;
+    if cap == 0 {
+        return Err(setup_error("runtime::channel_to_host: cap must be >= 1"));
+    }
+    if cap > MAX_CAP {
+        return Err(setup_error("runtime::channel_to_host: cap is too large"));
+    }
+    let (tx, rx) = mpsc::channel(cap);
+    let table: Table = ctor.call((ChanUd(chan::new_to_host(tx)), true))?;
+    Ok((LuaChannel(table), Receiver { inner: rx }))
+}
+
+/// The Lua side of a host channel or of a channel to the host: the
+/// `task` library's `Channel` object, receive-only or send-only.  Set it
+/// where Lua code can reach it (it implements [`IntoLua`]), e.g.
+/// `lua.globals().set("events", ch)`.
 #[derive(Clone, Debug)]
 pub struct LuaChannel(Table);
 
@@ -385,6 +471,82 @@ impl<T> fmt::Display for TrySendError<T> {
 }
 
 impl<T> std::error::Error for TrySendError<T> {}
+
+/// The host's end of a channel to the host (see [`channel_to_host`]).
+/// `Send`, not `Clone`.
+///
+/// Dropping it closes the channel: Lua's sends raise from then on.
+pub struct Receiver<T> {
+    inner: mpsc::Receiver<T>,
+}
+
+impl<T> fmt::Debug for Receiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Receiver")
+            .field("closed", &self.is_closed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> Receiver<T> {
+    /// Receive the next value, waiting while the channel is empty.
+    /// `None` once the channel is closed and every queued value has
+    /// been received.
+    ///
+    /// Cancel safe: dropping the future before it resolves received
+    /// nothing.
+    pub async fn recv(&mut self) -> Option<T> {
+        self.inner.recv().await
+    }
+
+    /// Receive the next value without waiting.
+    ///
+    /// # Errors
+    ///
+    /// [`TryRecvError::Empty`] when no value is queued and the channel
+    /// is open, [`TryRecvError::Closed`] when it is closed and every
+    /// queued value has been received.
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        self.inner.try_recv().map_err(|e| match e {
+            mpsc::error::TryRecvError::Empty => TryRecvError::Empty,
+            mpsc::error::TryRecvError::Disconnected => TryRecvError::Closed,
+        })
+    }
+
+    /// Close the channel: Lua's sends raise from now on (and waiting
+    /// ones wake and raise); the values already queued can still be
+    /// received.  Idempotent.
+    pub fn close(&mut self) {
+        self.inner.close();
+    }
+
+    /// Whether the channel is closed: [`close`](Self::close) was called,
+    /// Lua called `close` on it, or the Lua side was collected (or the
+    /// VM dropped).  Values may still be queued.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+/// [`Receiver::try_recv`] found no value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// No value is queued; the channel is open.
+    Empty,
+    /// The channel is closed and every queued value has been received.
+    Closed,
+}
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TryRecvError::Empty => f.write_str("channel to the host is empty"),
+            TryRecvError::Closed => f.write_str("channel to the host is closed"),
+        }
+    }
+}
+
+impl std::error::Error for TryRecvError {}
 
 /// [`Sender::request`] failed.
 #[derive(Clone, Copy, PartialEq, Eq)]

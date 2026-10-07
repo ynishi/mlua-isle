@@ -126,6 +126,8 @@
 //!
 //! A host channel (`channel`) and a ticker are `Channel` objects like
 //! `task.channel`'s, receive-only: `send` / `try_send` and send cases
+//! raise.  A channel to the host (`channel_to_host`) is one too,
+//! send-only: `recv` / `try_recv` / `on` / `arm_recv` and receive cases
 //! raise.
 //!
 //! Tasks are **structured**: when a coroutine request or task finishes,
@@ -262,12 +264,13 @@
 //!   raises.
 //!
 //! **Send cases** (`ch:on_send(v, f)` / `ch:arm_send(v)`, local channels
-//! only)
+//! and channels to the host)
 //!
 //! - Ready when `v` can be pushed (room in a buffered channel; for a
-//!   rendezvous channel, once a receiver has taken the offer) or when
-//!   the channel is closed (`sent = false`).  The value enters the
-//!   channel only for the chosen case.
+//!   rendezvous channel, once a receiver has taken the offer; for a
+//!   channel to the host, once room is reserved) or when the channel is
+//!   closed (`sent = false`).  The value enters the channel only for the
+//!   chosen case.
 //!
 //! **Task cases** (`h:on(f)` / `h:arm()`, a `task.spawn` handle)
 //!
@@ -446,6 +449,67 @@
 //! side keeps a front buffer for it; the tokio channel itself cannot
 //! take a value back).
 //!
+//! # Channels to the host
+//!
+//! `channel_to_host` (`tokio` feature) creates a channel that a running
+//! Lua loop feeds and `Send` host code drains: its Lua side, a
+//! `LuaChannel` (the `task` library's `Channel` object, send-only), and
+//! a `Receiver` (`Send`, not `Clone`) for the host:
+//!
+//! ```text
+//! let (reports, mut rx) = channel_to_host::<Report>(&lua, 64)?;   // on the VM thread
+//! lua.globals().set("reports", reports)?;
+//! while let Some(r) = rx.recv().await { ... }                     // any thread or task
+//! rx.try_recv();   // Ok(v), Err(TryRecvError::Empty), Err(TryRecvError::Closed)
+//! rx.close();      // Lua's sends raise from now on; queued values can still be received
+//! ```
+//!
+//! ```lua
+//! reports:send(r)                    -- waits while full
+//! local ok = reports:try_send(r)     -- false when full
+//! task.select({ reports:on_send(r, function(sent) ... end) })
+//! reports:close()                    -- the host receives the queued values, then None
+//! ```
+//!
+//! Call `channel_to_host` on the VM thread, after [`Vm::attach`] and
+//! `Vm::task_lib`; for an `AsyncIsle`, in an `exec` request that returns
+//! the `Receiver` (example on `channel_to_host`).
+//!
+//! - `cap >= 1` (a tokio bounded channel; `cap = 0` is an error).  One
+//!   host receiver; any number of Lua senders (tasks, selects).
+//!   `ch:cap()` is `cap`; `ch:len()` is the number of values queued for
+//!   the host (`0` once Lua closed the channel).
+//! - Each Lua send first reserves room in the tokio channel (tokio's
+//!   `Sender::reserve_owned`; every waiting Lua sender has its own place
+//!   in tokio's queue, in the order they started waiting).  Then the
+//!   value is converted to `T` (`T: FromLua`) on the VM thread and
+//!   queued, in the same step.  A value that fails to convert raises in
+//!   the sender (`send`, `try_send`, or the select with the chosen
+//!   `on_send` case) and is not queued; its room is given back.
+//! - `send` waits while the channel is full; `try_send` returns `false`
+//!   when full.  Both raise "channel is closed" when the channel is
+//!   closed: by `rx.close()`, by dropping `rx`, or by Lua's `close`.
+//!   Waiting senders wake and raise at the close.
+//! - A send case (`on_send` / `arm_send`) is ready when room is
+//!   reserved, or when the channel is closed (`sent = false`); it
+//!   converts and queues the value only when it is chosen.  With
+//!   `default`, it is ready only when there is room at the first check
+//!   (`try_reserve`).
+//! - Lua's `close`: the host receives the values already queued, then
+//!   `recv` returns `None` (`try_recv` `Closed`).  When the Lua side is
+//!   collected (or the VM dropped), the same.  `rx.close()` keeps the
+//!   queued values receivable.
+//! - Delivery: a send is delivered when its value is in the tokio
+//!   queue.  A send cancelled before that (a cancelled `send`, a select
+//!   that chose another case or was cancelled) consumed nothing: its
+//!   reservation, if it had one, is released, and the room goes to the
+//!   next waiting sender.
+//! - `recv`, `try_recv`, `on`, `arm_recv` raise ("channel is
+//!   send-only"), and so does a select given a receive case built by
+//!   hand on such a channel.
+//! - Ordering between several Lua senders is the order in which their
+//!   sends complete; each value arrives exactly once.
+//!
 //! # Host tasks
 //!
 //! A host function that starts work of its own takes the scope of the
@@ -484,7 +548,8 @@ pub use crate::error::{Cancelled, IsleError, LuaErrorKind, LuaFailure};
 pub use crate::hook::{current_token, CancelToken};
 #[cfg(feature = "tokio")]
 pub use crate::host_chan::{
-    channel, LuaChannel, Request, RequestError, SendError, Sender, TrySendError,
+    channel, channel_to_host, LuaChannel, Receiver, Request, RequestError, SendError, Sender,
+    TryRecvError, TrySendError,
 };
 #[cfg(feature = "tokio")]
 pub use crate::scope::{cancellable, current_scope, ScopeHandle, ScopedTask};

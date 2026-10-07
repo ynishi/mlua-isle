@@ -35,10 +35,25 @@
 //! A **ticker** (`task.ticker`) is a local channel of capacity 1 that is
 //! receive-only on the Lua side and fed by a host task with
 //! [`push_newest`].
+//!
+//! A **channel to the host** (`runtime::channel_to_host`) is a `ChanCore`
+//! with a [`HostSink`]: the sending end of a `tokio::sync::mpsc` channel
+//! whose receiver is `Send` host code.  It holds no values of its own
+//! and is send-only on the Lua side.  A Lua send first reserves room
+//! with tokio's `Sender::reserve_owned`: the reservation future is held
+//! by the waiting [`Sending`], so every waiting Lua sender has its own
+//! place (and waker) in tokio's queue, in arrival order.  Once room is
+//! reserved, the value is converted (`FromLua`, on the VM thread) and
+//! sent through the permit in the same poll; a value that fails to
+//! convert is not sent and the permit, dropped, gives the room back.
+//! Dropping the waiting `Sending` drops the reservation future (or the
+//! permit), which gives its place and any room assigned to it back.
 
-use mlua::{IntoLua, Lua, Value};
+use mlua::{FromLua, IntoLua, Lua, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
@@ -71,6 +86,12 @@ pub(crate) struct ChanCore {
     waiters: VecDeque<Rc<Waiter>>,
     /// A ticker: receive-only on the Lua side, fed by the host.
     ticker: bool,
+    /// The host end that a channel to the host feeds; `None` otherwise.
+    sink: Option<Rc<dyn HostSink>>,
+    /// Channel to the host: the Lua senders waiting for room, so that a
+    /// Lua `close` can wake them (tokio wakes them for room and for the
+    /// host's close).  Each waiting [`Sending`] removes its own entry.
+    sink_waiters: Vec<Rc<RefCell<Waker>>>,
 }
 
 /// The select that a rendezvous offer or waiter belongs to: one per
@@ -144,6 +165,8 @@ impl ChanCore {
             offers: VecDeque::new(),
             waiters: VecDeque::new(),
             ticker: false,
+            sink: None,
+            sink_waiters: Vec::new(),
         }
     }
 
@@ -301,6 +324,99 @@ impl<T: IntoLua + 'static> HostSource for HostRx<T> {
     }
 }
 
+/// A reservation of room in a channel to the host in progress: the
+/// `Sender::reserve_owned` future, converting its permit for the VM.
+pub(crate) type Reserve = Pin<Box<dyn Future<Output = Result<Box<dyn SinkPermit>, Closed>>>>;
+
+/// The host end of a channel to the host: the sending end of the
+/// host's `tokio::sync::mpsc` channel, converting each Lua value to the
+/// host's type when it is sent (on the VM thread).
+pub(crate) trait HostSink {
+    /// Start reserving room for one value; `Err(Closed)` when Lua
+    /// closed the channel.  The future resolves with the permit, or
+    /// `Err(Closed)` when the host closed or dropped its receiver.
+    fn reserve(&self) -> Result<Reserve, Closed>;
+    /// Reserve room without waiting: `Ok(None)` when the channel is full.
+    fn try_reserve(&self) -> Result<Option<Box<dyn SinkPermit>>, Closed>;
+    /// Lua's `close`: drop the sending end, so that the host receives
+    /// the queued values and then `None` (once the senders still waiting
+    /// let go of theirs).
+    fn close(&self);
+    /// Whether the channel is closed (by Lua's `close`, or because the
+    /// host closed or dropped its receiver).
+    fn is_closed(&self) -> bool;
+    /// The room taken: values queued and not yet received by the host.
+    fn len(&self) -> usize;
+    /// The capacity the channel was created with.
+    fn cap(&self) -> usize;
+}
+
+/// Room reserved in a channel to the host (a tokio `OwnedPermit`).
+pub(crate) trait SinkPermit {
+    /// Convert `v` to the host's type and send it.  A value that fails
+    /// to convert is not sent; the permit is dropped and its room given
+    /// back.
+    fn send(self: Box<Self>, lua: &Lua, v: Value) -> mlua::Result<()>;
+}
+
+impl<T: FromLua + Send + 'static> SinkPermit for mpsc::OwnedPermit<T> {
+    fn send(self: Box<Self>, lua: &Lua, v: Value) -> mlua::Result<()> {
+        let value = T::from_lua(v, lua)?;
+        // The returned `Sender` is dropped: after a Lua `close`, the
+        // last one closes the channel behind this value.
+        drop((*self).send(value));
+        Ok(())
+    }
+}
+
+/// The [`HostSink`] over a `tokio::sync::mpsc::Sender<T>`.
+struct HostTx<T> {
+    /// `None` once Lua closed the channel.
+    tx: RefCell<Option<mpsc::Sender<T>>>,
+    cap: usize,
+}
+
+impl<T: FromLua + Send + 'static> HostSink for HostTx<T> {
+    fn reserve(&self) -> Result<Reserve, Closed> {
+        let tx = self.tx.borrow().clone().ok_or(Closed)?;
+        Ok(Box::pin(async move {
+            match tx.reserve_owned().await {
+                Ok(permit) => Ok(Box::new(permit) as Box<dyn SinkPermit>),
+                Err(_) => Err(Closed),
+            }
+        }))
+    }
+
+    fn try_reserve(&self) -> Result<Option<Box<dyn SinkPermit>>, Closed> {
+        let tx = self.tx.borrow().clone().ok_or(Closed)?;
+        match tx.try_reserve_owned() {
+            Ok(permit) => Ok(Some(Box::new(permit))),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(None),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Closed),
+        }
+    }
+
+    fn close(&self) {
+        let tx = self.tx.borrow_mut().take();
+        drop(tx);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.tx.borrow().as_ref().is_none_or(|tx| tx.is_closed())
+    }
+
+    fn len(&self) -> usize {
+        self.tx
+            .borrow()
+            .as_ref()
+            .map_or(0, |tx| tx.max_capacity() - tx.capacity())
+    }
+
+    fn cap(&self) -> usize {
+        self.cap
+    }
+}
+
 /// The channel was closed.
 #[derive(Debug)]
 pub(crate) struct Closed;
@@ -356,6 +472,27 @@ pub(crate) fn new_host<T: IntoLua + 'static>(rx: mpsc::Receiver<T>) -> Chan {
         fan,
     };
     Rc::new(RefCell::new(ChanCore::with_cap(cap, Some(Rc::new(source)))))
+}
+
+/// Create a channel to the host over `tx` (capacity
+/// `tx.max_capacity()`).
+pub(crate) fn new_to_host<T: FromLua + Send + 'static>(tx: mpsc::Sender<T>) -> Chan {
+    let cap = tx.max_capacity();
+    let mut core = ChanCore::with_cap(cap, None);
+    core.sink = Some(Rc::new(HostTx {
+        tx: RefCell::new(Some(tx)),
+        cap,
+    }));
+    Rc::new(RefCell::new(core))
+}
+
+/// Why `chan` is send-only on the Lua side (a channel to the host), or
+/// `None`.
+pub(crate) fn send_only(chan: &Chan) -> Option<&'static str> {
+    chan.borrow()
+        .sink
+        .is_some()
+        .then_some("a channel to the host; the host receives")
 }
 
 /// Why `chan` is receive-only on the Lua side (a host channel or a
@@ -464,40 +601,57 @@ fn poll_send(
     Poll::Pending
 }
 
-/// Push `v` if there is room, without waiting.  `Ok(false)` when full.
+/// Push `v` if there is room, without waiting.  `Ok(Ok(false))` when
+/// full, `Ok(Err(Closed))` when closed.
 ///
 /// Rendezvous: fill the slot of the first waiting receiver (a plain
 /// `recv` or a select's receive case whose select has no case yet) and
 /// wake it; `Ok(false)` when no receiver is waiting.  Nothing is posted.
-pub(crate) fn try_send(chan: &Chan, v: Value) -> Result<bool, Closed> {
+///
+/// Channel to the host: reserve room without waiting, then convert `v`
+/// and send it.  `Err` when `v` fails to convert (nothing is sent and
+/// the room is given back).
+pub(crate) fn try_send(chan: &Chan, lua: &Lua, v: Value) -> mlua::Result<Result<bool, Closed>> {
     let mut c = chan.borrow_mut();
     if c.closed {
-        return Err(Closed);
+        return Ok(Err(Closed));
+    }
+    if let Some(sink) = c.sink.clone() {
+        // Converted without holding the borrow: the conversion may run
+        // Lua code.
+        drop(c);
+        return match sink.try_reserve() {
+            Ok(Some(permit)) => permit.send(lua, v).map(|()| Ok(true)),
+            Ok(None) => Ok(Ok(false)),
+            Err(closed) => Ok(Err(closed)),
+        };
     }
     if c.cap == 0 {
         let filled = c.fill_waiter(v, &None);
         drop(c);
-        return Ok(match filled {
+        return Ok(Ok(match filled {
             Ok(waker) => {
                 waker.wake();
                 true
             }
             Err(_) => false,
-        });
+        }));
     }
     if c.buf.len() >= c.cap {
-        return Ok(false);
+        return Ok(Ok(false));
     }
     c.buf.push_back(v);
     let wakers = std::mem::take(&mut c.recv_wakers);
     drop(c);
     wake_all(wakers);
-    Ok(true)
+    Ok(Ok(true))
 }
 
 /// Close the channel and wake everyone waiting on it.  Idempotent.
 /// For a host channel, the host's sends fail from now on.  Rendezvous:
-/// the open offers are withdrawn (their senders see the close).
+/// the open offers are withdrawn (their senders see the close).  For a
+/// channel to the host, the sending end is dropped (the host receives
+/// the queued values, then `None`) and the waiting Lua senders raise.
 pub(crate) fn close(chan: &Chan) {
     let mut c = chan.borrow_mut();
     if c.closed {
@@ -507,32 +661,45 @@ pub(crate) fn close(chan: &Chan) {
     if let Some(source) = &c.source {
         source.close();
     }
+    let sink = c.sink.clone();
     let mut wakers = c.receiver_wakers();
     wakers.append(&mut c.send_wakers);
+    wakers.extend(c.sink_waiters.iter().map(|w| w.borrow().clone()));
     for offer in std::mem::take(&mut c.offers) {
         offer.state.set(OfferState::Withdrawn);
         wakers.push(offer.waker.borrow().clone());
     }
     drop(c);
+    if let Some(sink) = sink {
+        sink.close();
+    }
     wake_all(wakers);
 }
 
 pub(crate) fn is_closed(chan: &Chan) -> bool {
     let c = chan.borrow();
-    c.closed || c.source.as_ref().is_some_and(|s| s.is_closed())
+    c.closed
+        || c.source.as_ref().is_some_and(|s| s.is_closed())
+        || c.sink.as_ref().is_some_and(|s| s.is_closed())
 }
 
 /// Values held: the front buffer plus, for a host channel, the values
 /// queued by the host.  A rendezvous channel holds nothing (its offers
-/// are not counted) except a value given back to its front.
+/// are not counted) except a value given back to its front.  A channel
+/// to the host: the values queued for the host (`0` after Lua closed
+/// it).
 pub(crate) fn len(chan: &Chan) -> usize {
     let c = chan.borrow();
-    c.buf.len() + c.source.as_ref().map_or(0, |s| s.len())
+    c.buf.len() + c.source.as_ref().map_or(0, |s| s.len()) + c.sink.as_ref().map_or(0, |s| s.len())
 }
 
 pub(crate) fn cap(chan: &Chan) -> usize {
     let c = chan.borrow();
-    c.source.as_ref().map_or(c.cap, |s| s.cap())
+    match (&c.source, &c.sink) {
+        (Some(s), _) => s.cap(),
+        (_, Some(s)) => s.cap(),
+        _ => c.cap,
+    }
 }
 
 /// Push a tick into a ticker's channel, replacing the unread one if the
@@ -670,19 +837,28 @@ impl Drop for Receiving {
 /// A send into a channel in progress: a `send`, or a select's send
 /// case.  On a rendezvous channel it holds the sender's [`Offer`] while
 /// it waits; dropping it (or [`withdraw`]) withdraws an offer that was
-/// not taken.
+/// not taken.  On a channel to the host it holds the reservation of
+/// room while it waits; dropping it (or `withdraw`) drops the
+/// reservation, which gives the room back.
 ///
 /// [`withdraw`]: Sending::withdraw
 pub(crate) struct Sending {
     chan: Chan,
-    /// The value, until it is pushed (buffered) or posted (rendezvous).
+    /// The value, until it is pushed (buffered), posted (rendezvous) or
+    /// converted and sent (channel to the host).
     value: Option<Value>,
     select: Option<Mark>,
     offer: Option<Rc<Offer>>,
-    /// Rendezvous, for a select's check without waiting (`default`):
+    /// For a select's check without waiting (`default`).  Rendezvous:
     /// hand the value to a waiting receiver, as `try_send` does, instead
-    /// of posting an offer.
+    /// of posting an offer.  Channel to the host: reserve room only if
+    /// there is some now (`try_reserve`).
     eager: bool,
+    /// Channel to the host: the reservation of room, while it waits.
+    reserve: Option<Reserve>,
+    /// Channel to the host: this sender's entry in the channel's
+    /// `sink_waiters`, while it waits.
+    sink_wait: Option<Rc<RefCell<Waker>>>,
 }
 
 impl Sending {
@@ -695,23 +871,108 @@ impl Sending {
             select,
             offer: None,
             eager: false,
+            reserve: None,
+            sink_wait: None,
         }
     }
 
-    /// Make the next poll of a rendezvous send not wait: it is ready
-    /// when a receiver is waiting (the value goes to that receiver's
-    /// slot, as with `try_send`) and posts no offer otherwise.
+    /// Make the next poll not wait.  Rendezvous: it is ready when a
+    /// receiver is waiting (the value goes to that receiver's slot, as
+    /// with `try_send`) and posts no offer otherwise.  Channel to the
+    /// host: it is ready when there is room now.
     pub(crate) fn set_eager(&mut self) {
         self.eager = true;
     }
 
-    /// `Ready(Ok)` once the value is sent, `Ready(Err(Closed))` when the
-    /// channel is closed (nothing sent).  Buffered: as [`poll_send`].
-    /// Rendezvous: the first poll posts the offer and wakes the waiting
-    /// receivers; the send is complete once a receiver took the offer.
-    /// An eager send (see [`set_eager`](Self::set_eager)) instead fills
-    /// the slot of a waiting receiver, or stays pending without posting.
-    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Closed>> {
+    /// `Ready(Ok(Ok))` once the value is sent, `Ready(Ok(Err(Closed)))`
+    /// when the channel is closed (nothing sent).  Buffered: as
+    /// [`poll_send`].  Rendezvous: the first poll posts the offer and
+    /// wakes the waiting receivers; the send is complete once a receiver
+    /// took the offer.  An eager send (see [`set_eager`](Self::set_eager))
+    /// instead fills the slot of a waiting receiver, or stays pending
+    /// without posting.  Channel to the host: see [`poll_sink`]
+    /// (`Ready(Err)` when the value fails to convert).
+    ///
+    /// [`poll_sink`]: Self::poll_sink
+    pub(crate) fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+        lua: &Lua,
+    ) -> Poll<mlua::Result<Result<(), Closed>>> {
+        let sink = self.chan.borrow().sink.clone();
+        if let Some(sink) = sink {
+            return self.poll_sink(cx, lua, &*sink);
+        }
+        self.poll_local(cx).map(Ok)
+    }
+
+    /// Send into a channel to the host: reserve room (waiting in tokio's
+    /// queue, or only if there is room now for an eager send), then
+    /// convert the value and send it through the permit, in this poll.
+    /// A value that fails to convert is `Ready(Err)`: nothing is sent and
+    /// the permit, dropped, gives the room back.
+    fn poll_sink(
+        &mut self,
+        cx: &mut Context<'_>,
+        lua: &Lua,
+        sink: &dyn HostSink,
+    ) -> Poll<mlua::Result<Result<(), Closed>>> {
+        if self.chan.borrow().closed {
+            self.withdraw();
+            return Poll::Ready(Ok(Err(Closed)));
+        }
+        let permit = if self.eager {
+            match sink.try_reserve() {
+                Ok(Some(permit)) => permit,
+                Ok(None) => return Poll::Pending,
+                Err(closed) => return Poll::Ready(Ok(Err(closed))),
+            }
+        } else {
+            let reserve = match &mut self.reserve {
+                Some(r) => r,
+                None => match sink.reserve() {
+                    Ok(r) => self.reserve.insert(r),
+                    Err(closed) => return Poll::Ready(Ok(Err(closed))),
+                },
+            };
+            match reserve.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.wait_sink(cx);
+                    return Poll::Pending;
+                }
+                Poll::Ready(got) => {
+                    self.withdraw();
+                    match got {
+                        Ok(permit) => permit,
+                        Err(closed) => return Poll::Ready(Ok(Err(closed))),
+                    }
+                }
+            }
+        };
+        let v = self.value.take().unwrap_or(Value::Nil);
+        Poll::Ready(permit.send(lua, v).map(Ok))
+    }
+
+    /// Register (or update) this sender's waker in the channel's
+    /// `sink_waiters`, which a Lua `close` wakes.
+    fn wait_sink(&mut self, cx: &mut Context<'_>) {
+        match &self.sink_wait {
+            Some(w) => {
+                let mut waker = w.borrow_mut();
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+            }
+            None => {
+                let w = Rc::new(RefCell::new(cx.waker().clone()));
+                self.chan.borrow_mut().sink_waiters.push(w.clone());
+                self.sink_wait = Some(w);
+            }
+        }
+    }
+
+    /// A send into a buffered or rendezvous local channel.
+    fn poll_local(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Closed>> {
         if self.chan.borrow().cap != 0 {
             return poll_send(&self.chan, cx, &mut self.value);
         }
@@ -771,8 +1032,17 @@ impl Sending {
     }
 
     /// Withdraw an offer that is still open (a taken one stays taken).
-    /// Idempotent.
+    /// Channel to the host: drop the reservation (giving back its place
+    /// in tokio's queue and any room assigned to it) and leave the
+    /// channel's `sink_waiters`.  Idempotent.
     pub(crate) fn withdraw(&mut self) {
+        self.reserve = None;
+        if let Some(w) = self.sink_wait.take() {
+            self.chan
+                .borrow_mut()
+                .sink_waiters
+                .retain(|x| !Rc::ptr_eq(x, &w));
+        }
         let Some(offer) = &self.offer else {
             return;
         };
