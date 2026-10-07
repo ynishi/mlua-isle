@@ -209,8 +209,10 @@ struct IsleId;
 ///
 /// `Send + Clone`: clone it into as many tokio tasks as needed; the
 /// clones share one registry entry.  The function stays alive in the
-/// VM while a clone exists; the entry is released (on the Lua thread,
-/// at a later request) when the last clone is dropped.
+/// VM while a clone exists.  Dropping the last clone only marks the
+/// entry free (mlua's `RegistryKey`); the function is released when
+/// the VM next stores a registry value (another `function` call, say)
+/// or calls [`Lua::expire_registry_values`](mlua::Lua::expire_registry_values).
 ///
 /// It belongs to the isle that created it: using it with another isle
 /// returns [`IsleError::WrongIsle`].
