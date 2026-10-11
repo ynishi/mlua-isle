@@ -284,33 +284,38 @@ impl<T> Sender<T> {
     }
 }
 
-impl<Req, Resp> Sender<Request<Req, Resp>> {
-    /// Send `req` as a [`Request`] and wait for Lua's reply.
+impl<Req, Resp, E> Sender<Request<Req, Resp, E>> {
+    /// Send `req` as a [`Request`] and wait for Lua's answer.
     ///
-    /// Waits while the channel is full, then until Lua replies.  There
-    /// is no timeout: an unanswered request that Lua neither replies to
-    /// nor closes is reported only when Lua collects it, so wrap the call
-    /// in [`tokio::time::timeout`].  Dropping the future (a timeout)
-    /// makes a later `req:reply(v)` in Lua return `false`.
+    /// Waits while the channel is full, then until Lua answers.  There
+    /// is no timeout: an unanswered request that Lua neither answers nor
+    /// closes is reported only when Lua collects it, so wrap the call in
+    /// [`tokio::time::timeout`].  Dropping the future (a timeout) makes a
+    /// later `req:reply(v)` or `req:reject(reason)` in Lua return `false`.
     ///
     /// # Errors
     ///
     /// [`RequestError::Closed`] with `req` when the channel is closed;
-    /// [`RequestError::NoReply`] when Lua closed or collected the request
-    /// without replying, or `req` failed to convert to a Lua value (Lua
-    /// never saw it).
-    pub async fn request(&self, req: Req) -> Result<Resp, RequestError<Req>> {
+    /// [`RequestError::Rejected`] with the reason when Lua called
+    /// `req:reject(reason)`; [`RequestError::NoReply`] when Lua closed or
+    /// collected the request without answering, or `req` failed to
+    /// convert to a Lua value (Lua never saw it).
+    pub async fn request(&self, req: Req) -> Result<Resp, RequestError<Req, E>> {
         let (reply, answer) = oneshot::channel();
         self.inner
             .send(Request { req, reply })
             .await
             .map_err(|e| RequestError::Closed(e.0.req))?;
-        answer.await.map_err(|_| RequestError::NoReply)
+        answer
+            .await
+            .map_err(|_| RequestError::NoReply)?
+            .map_err(RequestError::Rejected)
     }
 }
 
 /// A request sent with [`Sender::request`]: a `Req` and a one-shot
-/// reply of type `Resp`.
+/// answer, either a reply of type `Resp` or a rejection of type `E`
+/// (`String` by default).
 ///
 /// It is built by [`Sender::request`] only.  On the Lua side it is a
 /// userdata (converted when Lua takes it from the channel):
@@ -319,17 +324,18 @@ impl<Req, Resp> Sender<Request<Req, Resp>> {
 /// |---|---|
 /// | `req.value` | The `Req`, converted with `IntoLua`. |
 /// | `req:reply(v)` | Answer with `v`, converted with `Resp: FromLua`.  Returns `true`, or `false` when the requester stopped waiting (not an error).  Raises when the request was already answered or closed, and when the conversion fails (the request then stays unanswered and can be answered again). |
-/// | `req:replied()` | Whether `reply` succeeded (delivered or not). |
-/// | `local req <close> = ...` | Closing an unanswered request answers [`RequestError::NoReply`] at once.  Closing an answered one does nothing. |
+/// | `req:reject(reason)` | Answer with a rejection: the requester gets [`RequestError::Rejected`] with `reason`, converted with `E: FromLua`.  Returns and raises as `reply` does. |
+/// | `req:replied()` | Whether `reply` or `reject` succeeded (delivered or not). |
+/// | `local req <close> = ...` | Closing an unanswered request answers [`RequestError::NoReply`] at once.  Closing an answered (replied or rejected) one does nothing. |
 ///
 /// A request that is neither answered nor closed reports `NoReply` when
 /// Lua collects it.
-pub struct Request<Req, Resp> {
+pub struct Request<Req, Resp, E = String> {
     req: Req,
-    reply: oneshot::Sender<Resp>,
+    reply: oneshot::Sender<Result<Resp, E>>,
 }
 
-impl<Req: fmt::Debug, Resp> fmt::Debug for Request<Req, Resp> {
+impl<Req: fmt::Debug, Resp, E> fmt::Debug for Request<Req, Resp, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Request")
             .field("req", &self.req)
@@ -337,15 +343,16 @@ impl<Req: fmt::Debug, Resp> fmt::Debug for Request<Req, Resp> {
     }
 }
 
-impl<Req, Resp> IntoLua for Request<Req, Resp>
+impl<Req, Resp, E> IntoLua for Request<Req, Resp, E>
 where
     Req: IntoLua,
     Resp: FromLua + 'static,
+    E: FromLua + 'static,
 {
-    /// A userdata holding the reply; the converted `Req` is its user
-    /// value (in the collector's sight), read as `req.value`.  If `Req`
-    /// fails to convert, the reply is dropped (the requester gets
-    /// `NoReply`) and the error returned.
+    /// A userdata holding the answer channel; the converted `Req` is its
+    /// user value (in the collector's sight), read as `req.value`.  If
+    /// `Req` fails to convert, the answer channel is dropped (the
+    /// requester gets `NoReply`) and the error returned.
     fn into_lua(self, lua: &Lua) -> mlua::Result<Value> {
         let Request { req, reply } = self;
         let value = req.into_lua(lua)?;
@@ -357,56 +364,80 @@ where
     }
 }
 
-enum ReplyState<Resp> {
-    Open(oneshot::Sender<Resp>),
-    Replied,
+enum ReplyState<Resp, E> {
+    Open(oneshot::Sender<Result<Resp, E>>),
+    /// Replied or rejected.
+    Answered,
     Closed,
 }
 
 /// The Lua side of a [`Request`].
-struct RequestUd<Resp> {
-    state: RefCell<ReplyState<Resp>>,
+struct RequestUd<Resp, E> {
+    state: RefCell<ReplyState<Resp, E>>,
 }
 
-fn answered_error(state: &ReplyState<impl Sized>) -> Option<mlua::Error> {
-    match state {
-        ReplyState::Open(_) => None,
-        ReplyState::Replied => Some(mlua::Error::runtime("req:reply: request already answered")),
-        ReplyState::Closed => Some(mlua::Error::runtime("req:reply: request is closed")),
+impl<Resp, E> RequestUd<Resp, E> {
+    /// Answer with `answer` (already converted).  `method` names the Lua
+    /// method in the error messages.
+    fn answer(&self, method: &str, answer: Result<Resp, E>) -> mlua::Result<bool> {
+        let prev = std::mem::replace(&mut *self.state.borrow_mut(), ReplyState::Answered);
+        match prev {
+            ReplyState::Open(tx) => Ok(tx.send(answer).is_ok()),
+            other => {
+                // Answered or closed during the conversion.
+                let e = answered_error(method, &other);
+                *self.state.borrow_mut() = other;
+                Err(e.expect("not open"))
+            }
+        }
     }
 }
 
-impl<Resp: FromLua + 'static> UserData for RequestUd<Resp> {
+fn answered_error<Resp, E>(method: &str, state: &ReplyState<Resp, E>) -> Option<mlua::Error> {
+    match state {
+        ReplyState::Open(_) => None,
+        ReplyState::Answered => Some(mlua::Error::runtime(format!(
+            "req:{method}: request already answered"
+        ))),
+        ReplyState::Closed => Some(mlua::Error::runtime(format!(
+            "req:{method}: request is closed"
+        ))),
+    }
+}
+
+impl<Resp: FromLua + 'static, E: FromLua + 'static> UserData for RequestUd<Resp, E> {
     fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_function_get("value", |_, ud: AnyUserData| ud.user_value::<Value>());
     }
 
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // `reply` and `reject` take a `Value` and convert it by hand, so
+        // a conversion failure raises the plain conversion error (not
+        // one wrapped as a bad argument) and leaves the request open.
         methods.add_method("reply", |lua, this, v: Value| {
-            if let Some(e) = answered_error(&this.state.borrow()) {
+            if let Some(e) = answered_error("reply", &this.state.borrow()) {
                 return Err(e);
             }
             // Converted without holding the borrow: the conversion may
             // run Lua code (an allocation can run a `__gc`).
             let resp = Resp::from_lua(v, lua)?;
-            let prev = std::mem::replace(&mut *this.state.borrow_mut(), ReplyState::Replied);
-            match prev {
-                ReplyState::Open(tx) => Ok(tx.send(resp).is_ok()),
-                other => {
-                    // Answered or closed during the conversion.
-                    let e = answered_error(&other);
-                    *this.state.borrow_mut() = other;
-                    Err(e.expect("not open"))
-                }
+            this.answer("reply", Ok(resp))
+        });
+        methods.add_method("reject", |lua, this, v: Value| {
+            if let Some(e) = answered_error("reject", &this.state.borrow()) {
+                return Err(e);
             }
+            // As in `reply`: converted without holding the borrow.
+            let reason = E::from_lua(v, lua)?;
+            this.answer("reject", Err(reason))
         });
         methods.add_method("replied", |_, this, ()| {
-            Ok(matches!(*this.state.borrow(), ReplyState::Replied))
+            Ok(matches!(*this.state.borrow(), ReplyState::Answered))
         });
         methods.add_meta_method(MetaMethod::Close, |_, this, _: MultiValue| {
             let mut state = this.state.borrow_mut();
             if matches!(*state, ReplyState::Open(_)) {
-                // Drops the reply sender: the requester sees `NoReply`.
+                // Drops the answer sender: the requester sees `NoReply`.
                 *state = ReplyState::Closed;
             }
             Ok(())
@@ -547,31 +578,40 @@ impl fmt::Display for TryRecvError {
 impl std::error::Error for TryRecvError {}
 
 /// [`Sender::request`] failed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RequestError<Req> {
+///
+/// `E` is the rejection reason's type, `String` by default (the `E` of
+/// the [`Request`]).
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestError<Req, E = String> {
     /// The channel is closed.  Carries the request's value.
     Closed(Req),
-    /// Lua closed or collected the request without replying (or the
+    /// Lua closed or collected the request without answering (or the
     /// value failed to convert to a Lua value).
     NoReply,
+    /// Lua rejected the request with `req:reject(reason)`.  Carries the
+    /// reason, converted with `E: FromLua`.
+    Rejected(E),
 }
 
-impl<Req> fmt::Debug for RequestError<Req> {
+impl<Req, E: fmt::Debug> fmt::Debug for RequestError<Req, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RequestError::Closed(_) => f.write_str("Closed(..)"),
             RequestError::NoReply => f.write_str("NoReply"),
+            RequestError::Rejected(e) => f.debug_tuple("Rejected").field(e).finish(),
         }
     }
 }
 
-impl<Req> fmt::Display for RequestError<Req> {
+impl<Req, E: fmt::Display> fmt::Display for RequestError<Req, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RequestError::Closed(_) => f.write_str("host channel is closed"),
             RequestError::NoReply => f.write_str("request was not answered"),
+            RequestError::Rejected(e) => write!(f, "request was rejected: {e}"),
         }
     }
 }
 
-impl<Req> std::error::Error for RequestError<Req> {}
+impl<Req, E: fmt::Debug + fmt::Display> std::error::Error for RequestError<Req, E> {}

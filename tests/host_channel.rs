@@ -590,6 +590,22 @@ fn closing_an_answered_request_does_nothing() {
 }
 
 #[test]
+fn closing_a_rejected_request_does_nothing() {
+    let e = env();
+    let (lua, answer) = request_outcome(
+        &e,
+        "local delivered
+         do
+           local req <close> = requests:recv()
+           delivered = req:reject('no')
+         end
+         return tostring(delivered) .. ' ' .. wait_answer()",
+    );
+    assert_eq!(lua, "true Err(Rejected(\"no\"))");
+    assert_eq!(answer, Err(RequestError::Rejected("no".to_string())));
+}
+
+#[test]
 fn a_request_dropped_unanswered_answers_no_reply_when_collected() {
     let e = env();
     let (lua, answer) = request_outcome(
@@ -707,6 +723,137 @@ fn a_request_is_received_through_select() {
     });
     assert_eq!(to_string(lua_out), "true");
     assert_eq!(answer.unwrap(), 40);
+}
+
+#[test]
+fn a_request_is_rejected() {
+    let e = env();
+    let (lua, answer) = request_outcome(
+        &e,
+        "local req = requests:recv()
+         local delivered = req:reject('why')
+         return tostring(delivered) .. ' ' .. tostring(req:replied()) .. ' ' .. wait_answer()",
+    );
+    assert_eq!(lua, "true true Err(Rejected(\"why\"))");
+    assert_eq!(answer, Err(RequestError::Rejected("why".to_string())));
+}
+
+#[test]
+fn a_reject_after_the_requester_stopped_waiting_returns_false() {
+    let e = env();
+    let tx = e.channel::<Request<i64, String>>("requests", 4);
+    e.block_on(async {
+        // As in the reply case: send, then drop the waiting future.
+        let mut fut = pin!(tx.request(7));
+        std::future::poll_fn(|cx| {
+            assert!(fut.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    });
+    let r = e.string(
+        "local req = requests:recv()
+         local delivered = req:reject('late')
+         return table.concat({ req.value, tostring(delivered), tostring(req:replied()) }, ' ')",
+    );
+    assert_eq!(r, "7 false true");
+}
+
+#[test]
+fn a_reject_after_a_reply_raises_and_a_reply_after_a_reject_raises() {
+    let e = env();
+    let (lua, answer) = request_outcome(
+        &e,
+        "local req = requests:recv()
+         req:reply('once')
+         local ok, err = pcall(req.reject, req, 'no')
+         return tostring(ok) .. ' ' .. (tostring(err):match('req:reject: request already answered') or tostring(err))
+                .. ' ' .. wait_answer()",
+    );
+    assert_eq!(
+        lua,
+        "false req:reject: request already answered Ok(\"once\")"
+    );
+    assert_eq!(answer.unwrap(), "once");
+
+    let e = env();
+    let (lua, answer) = request_outcome(
+        &e,
+        "local req = requests:recv()
+         req:reject('no')
+         local ok, err = pcall(req.reply, req, 'yes')
+         local ok2, err2 = pcall(req.reject, req, 'again')
+         return tostring(ok) .. ' ' .. (tostring(err):match('req:reply: request already answered') or tostring(err))
+                .. ' ' .. tostring(ok2) .. ' ' .. (tostring(err2):match('req:reject: request already answered') or tostring(err2))
+                .. ' ' .. wait_answer()",
+    );
+    assert_eq!(
+        lua,
+        "false req:reply: request already answered false req:reject: request already answered Err(Rejected(\"no\"))"
+    );
+    assert_eq!(answer, Err(RequestError::Rejected("no".to_string())));
+}
+
+#[test]
+fn a_reject_of_a_closed_request_raises() {
+    let e = env();
+    let (lua, answer) = request_outcome(
+        &e,
+        "local req = requests:recv()
+         do local closing <close> = req end
+         local ok, err = pcall(req.reject, req, 'late')
+         return tostring(ok) .. ' ' .. (tostring(err):match('req:reject: request is closed') or tostring(err))
+                .. ' ' .. wait_answer()",
+    );
+    assert_eq!(lua, "false req:reject: request is closed Err(NoReply)");
+    assert!(matches!(answer, Err(RequestError::NoReply)));
+}
+
+#[test]
+fn a_reject_that_fails_to_convert_raises_and_can_be_answered_again() {
+    let e = env();
+    // mlua's `String: FromLua` coerces numbers to strings, so a table is
+    // the reason that fails to convert to the default `E = String`.
+    let (lua, answer) = request_outcome(
+        &e,
+        "local req = requests:recv()
+         local ok = pcall(req.reject, req, {})
+         local replied = req:replied()
+         local delivered = req:reply('after all')
+         return tostring(ok) .. ' ' .. tostring(replied) .. ' ' .. tostring(delivered) .. ' ' .. wait_answer()",
+    );
+    assert_eq!(lua, "false false true Ok(\"after all\")");
+    assert_eq!(answer.unwrap(), "after all");
+}
+
+#[test]
+fn a_request_is_rejected_with_a_typed_reason() {
+    let e = env();
+    let tx = e.channel::<Request<i64, String, i64>>("requests", 4);
+    let (lua_out, answer) = e.block_on(async {
+        tokio::join!(
+            e.root(
+                "local req = requests:recv()
+                 local ok = pcall(req.reject, req, 'not a number')
+                 local delivered = req:reject(req.value * 100 + 4)
+                 return tostring(ok) .. ' ' .. tostring(delivered) .. ' ' .. tostring(req:replied())"
+            ),
+            tx.request(4),
+        )
+    });
+    assert_eq!(to_string(lua_out), "false true true");
+    let r: Result<String, RequestError<i64, i64>> = answer;
+    assert_eq!(r, Err(RequestError::Rejected(404)));
+}
+
+#[test]
+fn a_rejected_request_error_shows_its_reason() {
+    let err: RequestError<i64> = RequestError::Rejected("why".to_string());
+    assert_eq!(format!("{err:?}"), "Rejected(\"why\")");
+    assert_eq!(err.to_string(), "request was rejected: why");
+    // Still a `Box<dyn Error>` with the default `E = String`.
+    let boxed: Box<dyn std::error::Error> = Box::new(err);
+    assert_eq!(boxed.to_string(), "request was rejected: why");
 }
 
 // ── 10. runtime::channel needs an attached VM with its task library ──
