@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Breaking
+- `RequestError` has a new variant, `Rejected(E)`, is no longer `Copy`,
+  and is `#[non_exhaustive]`.  `Request` and `RequestError` take a new
+  type parameter, the rejection reason `E = String`
+  (`Request<Req, Resp, E>`, `RequestError<Req, E>`); type spellings
+  `Request<Req, Resp>` / `RequestError<Req>` compile unchanged (an
+  unannotated `RequestError::..` expression may now need a type).
+  `RequestError`'s `Debug` / `Display` / `Error` impls now need
+  `E: Debug` / `E: Display` (`String` has both).  Migration: add a
+  wildcard (`_`) arm to matches on `RequestError` (it is
+  `#[non_exhaustive]`).
+
+### Added
+- `req:reject(reason)` on a `Request` in Lua (#32): answers with a
+  rejection, and `Sender::request` returns `RequestError::Rejected(reason)`
+  (`reason` converted with `E: FromLua`, `String` by default).  Returns
+  `true`, or `false` when the requester stopped waiting; raises as
+  `req:reply` does when the request was already answered or closed, and on
+  a conversion error (the request stays open).  `req:replied()` is `true`
+  after a `reject` too.
+
 ### Fixed
 - Building without the `tokio` feature no longer warns that
   `runtime::of_or_attach` is unused (0.9.0 removed its last caller outside

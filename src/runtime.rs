@@ -122,7 +122,7 @@
 //! | `task.select(cases, opts)` | Wait until one case is ready, take it, call its handler and return what the handler returns.  `opts.biased` (default `false`): check the cases in order instead of round robin.  `opts.default = f`: if no case is ready, call `f()` instead of waiting. |
 //! | `ch:arm_recv()`, `ch:arm_send(v)`, `t:arm()`, `h:arm()` | A case for `task.select_raw`. |
 //! | `task.select_raw(arms, opts)` | As `task.select`, without handlers: returns the index of the chosen case and its values (`i, v, ok` for a receive, `i, sent` for a send, `i` for a timer, `i, ok, ...` for a task).  `opts.default = true`: return `0` if no case is ready. |
-//! | `req.value`, `req:reply(v)`, `req:replied()`, `local req <close> = ...` | A `Request` received from a host channel.  See [Host channels and requests](#host-channels-and-requests). |
+//! | `req.value`, `req:reply(v)`, `req:reject(reason)`, `req:replied()`, `local req <close> = ...` | A `Request` received from a host channel.  See [Host channels and requests](#host-channels-and-requests). |
 //!
 //! A host channel (`channel`) and a ticker are `Channel` objects like
 //! `task.channel`'s, receive-only: `send` / `try_send` and send cases
@@ -419,11 +419,13 @@
 //!
 //! **Request**
 //!
-//! - A `Request<Req, Resp>` carries a `Req` and a one-shot
-//!   reply.  `Sender::request` sends it and waits for the reply:
-//!   `RequestError::Closed` (with the `Req`) if the channel is closed,
-//!   `RequestError::NoReply` if the request is closed or collected
-//!   without a reply (or the `Req` failed to convert to a Lua value).
+//! - A `Request<Req, Resp, E = String>` carries a `Req` and a one-shot
+//!   answer: a `Resp` or a rejection reason `E`.  `Sender::request`
+//!   sends it and waits for the answer: `RequestError::Closed` (with
+//!   the `Req`) if the channel is closed, `RequestError::Rejected` (with
+//!   the reason) if Lua rejected it, `RequestError::NoReply` if the
+//!   request is closed or collected without an answer (or the `Req`
+//!   failed to convert to a Lua value).
 //! - On the Lua side it is a userdata: `req.value` is the `Req`
 //!   (converted with `IntoLua` when Lua received it); `req:reply(v)`
 //!   converts `v` with `Resp: FromLua` and returns `true`, or `false`
@@ -431,16 +433,23 @@
 //!   a timeout; not an error).  A second `reply` raises, and so does a
 //!   `reply` after the request was closed.  A conversion error raises
 //!   and leaves the request unanswered: it can be answered again.
-//!   `req:replied()` is whether a `reply` succeeded.
+//! - `req:reject(reason)` answers with a rejection: the requester gets
+//!   `RequestError::Rejected(reason)`, `reason` converted with
+//!   `E: FromLua` (`String` by default).  It returns as `reply` does
+//!   (`false` when the requester stopped waiting).  A conversion error
+//!   raises and leaves the request unanswered; a `reply` or `reject`
+//!   after the request was answered (replied or rejected) or closed
+//!   raises.
+//! - `req:replied()` is whether a `reply` or `reject` succeeded.
 //! - Closing an unanswered request (`local req <close> = ...`, at scope
 //!   exit or on an error) answers `NoReply` at once.  A request that is
 //!   neither answered nor closed is reported `NoReply` only when Lua
 //!   collects it, so a requester should use a timeout, and Lua code that
-//!   may fail between receiving and replying should hold the request in
+//!   may fail between receiving and answering should hold the request in
 //!   a `<close>` variable.
 //! - `select`'s handler form does not close a request its handler
 //!   returns without answering: the handler may hand it to a task that
-//!   replies later.  Close it in the handler (or let it be collected).
+//!   answers later.  Close it in the handler (or let it be collected).
 //!
 //! **Delivery and cancellation** are as for local channels (above): a
 //! wait cancelled before it is ready consumed nothing, and a value
