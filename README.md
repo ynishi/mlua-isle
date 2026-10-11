@@ -84,19 +84,19 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mlua-isle = "0.9"
+mlua-isle = "0.10"
 
 # For async support (includes coroutine execution):
-# mlua-isle = { version = "0.9", features = ["tokio"] }
+# mlua-isle = { version = "0.10", features = ["tokio"] }
 
 # For connection pool:
-# mlua-isle = { version = "0.9", features = ["pool"] }
+# mlua-isle = { version = "0.10", features = ["pool"] }
 
 # Both:
-# mlua-isle = { version = "0.9", features = ["tokio", "pool"] }
+# mlua-isle = { version = "0.10", features = ["tokio", "pool"] }
 
 # The value a Lua error raised, as JSON, on `LuaFailure::value`:
-# mlua-isle = { version = "0.9", features = ["serde"] }
+# mlua-isle = { version = "0.10", features = ["serde"] }
 ```
 
 ### Sync API
