@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-11
+
 ### Breaking
 - `RequestError` has a new variant, `Rejected(E)`, is no longer `Copy`,
   and is `#[non_exhaustive]`.  `Request` and `RequestError` take a new
